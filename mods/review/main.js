@@ -4,7 +4,7 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, h_resizable, resizable_panel, TextareaState, Textarea, EditorState, Editor, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, terminals, props, shared, setShared, settings, nextCommand, window, hc } from "herdr";
 import { errorText } from "./model.js";
-import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "./page.js";
+import { buildPage, fileNavigation, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "./page.js";
 import { desktopColors } from "./desktop.js";
 import { submitToIdleAgent } from "./delivery.js";
 import { filePaneKey, filePanePreferences, filePaneBounds } from "./sidebar.js";
@@ -107,8 +107,10 @@ export default class Review extends View {
   rebuild(_cx) {
     this.canSaveNote = Boolean(this.note.value().trim());
     this.manifestSignature = JSON.stringify([this.root, this.base, this.files, this.comments, this.viewed]);
-    this.rows = buildPage(this.files, this.entries, this.comments, this.selection, { width: this.width || 840, collapsed: this.collapsed });
-    this.byKey = new Map(this.rows.map(r => [r.key, r]));
+    this.rows = buildPage(this.files, this.entries, this.comments, this.selection, { width: this.width || 840, viewportHeight: this.pageHeight || 0, collapsed: this.collapsed });
+    const navigation = fileNavigation(this.rows, this.activePath, this.pageHeight || 0);
+    this.items = navigation.items; this.jumpTarget = navigation.target;
+    this.byKey = new Map(this.items.filter(item => item.row).map(item => [item.key, item.row]));
     if (this.jumpPath) {
       const entry = this.entries.get(this.jumpPath);
       this.scrollTo(`file:${this.jumpPath}`, "top");
@@ -116,8 +118,9 @@ export default class Review extends View {
     }
   }
   scrollTo(key, strategy = "center") {
-    const index = this.rows.findIndex(r => r.key === key);
-    if (index >= 0) this.scroll.scroll_to_item(index, strategy);
+    const target = strategy === "top" && key === `file:${this.activePath}` && this.jumpTarget;
+    const index = (this.items || []).findIndex(item => item.key === (target || key));
+    if (index >= 0) this.scroll.scroll_to_item(index, target ? "center" : strategy);
   }
   applyManifest(data, revision, cx) {
     const comments = revision === this.revision ? data.comments : this.comments;
@@ -493,6 +496,17 @@ export default class Review extends View {
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.muted).whitespace_normal().child(row.text))
       .when(row.retry, el => el.child(control(`retry-${row.path}`, "Try again", "retry", !this.busy).h(23)));
   }
+  pageRow(row, t, selected, collapsed) {
+    const content = isCode(row) ? this.codeRow(row, t) : this.specialRow(row, t);
+    if (!selected || row.kind === "spacer") return content;
+    // Cards span many virtual rows. Paint a continuous outline over their
+    // edges without changing row geometry, wrapping, or list-owned hit zones.
+    const first = row.kind === "file", last = row.kind === "end" || (first && collapsed);
+    return div().h(row.height).w_full().relative().child(content)
+      .child(div().id(`card-outline:${row.key}`).absolute().inset_0().border_x(2).border_color(t.accent)
+        .when(first, el => el.border_t(2).rounded_t(6))
+        .when(last, el => el.border_b(2).rounded_b(6)));
+  }
   saveFilePane(patch, cx) {
     const previous = filePanePreferences(shared(filePaneKey));
     const next = filePanePreferences({ ...previous, ...patch });
@@ -562,22 +576,35 @@ export default class Review extends View {
       .when(!this.files.length, el => el.child(div().p(12).text_size(11).text_color(t.muted).child(this.scanning ? "Loading changes…" : "No uncommitted changes")));
   }
   page(t) {
-    const rows = this.rows;
+    const items = this.items || [], activePath = this.activePath, collapsed = this.collapsed.has(activePath);
     // Keep a coherent list version for the whole native layout pass. Nothing
     // here owns a JS row entity, event handler, or cached native element.
     return v_flex().id("review-page").flex_1().h_full().min_w(0).min_h(0).px(16).pt(12).bg(t.canvas)
       .on_size_change((size, cx) => {
-        const width = Math.max(200, size.width - 32);
-        if (Math.abs((this.width || 0) - width) > 1) { this.width = width; this.rebuild(cx); this.notify(cx); }
+        const width = Math.max(200, size.width - 32), height = Math.max(0, size.height - 12);
+        if (Math.abs((this.width || 0) - width) > 1 || Math.abs((this.pageHeight || 0) - height) > 1) {
+          this.width = width; this.pageHeight = height; this.rebuild(cx); this.notify(cx);
+        }
       })
       .child(div().id("review-hitbox").flex_1().w_full().min_h(0).relative()
         .on_mouse_down("left", e => { if (e.local_position && e.bounds) this.press = { x: e.local_position.x, width: e.bounds.width, shift: Boolean(e.modifiers?.shift) }; })
         .when(Boolean(this.jumpPath), el => el.on_scroll_wheel(() => { this.jumpPath = null; }))
-        .child(v_virtual_list("review-page-list", rows.length, rows.map(row => row.height), i => rows[i].key,
+        .child(v_virtual_list("review-page-list", items.length, items.map(item => item.height), i => items[i].key,
           range => {
-            const visible = rows.slice(range.start, range.end);
-            if (rows === this.rows) this.visiblePaths = [...new Set(visible.map(row => row.path))];
-            return visible.map(row => isCode(row) ? this.codeRow(row, t) : this.specialRow(row, t));
+            const visible = items.slice(range.start, range.end), keys = new Set(visible.map(item => item.key));
+            if (items === this.items) this.visiblePaths = [...new Set(visible.flatMap(item => item.row ? [item.row.path] : []))];
+            return visible.map(item => {
+              if (!item.row || (item.offset && keys.has(item.row.key))) return div().h(item.height);
+              const content = this.pageRow(item.row, t, item.row.path === activePath, collapsed);
+              if (item.height === item.row.height) return content;
+              // Render a sliced row only once per batch. The leading fragment
+              // overflows into the trailing one; if only the tail is visible,
+              // clip the same content at its original offset. No duplicate
+              // textareas, handlers, or altered code/comment hit coordinates.
+              return div().h(item.height).w_full().relative()
+                .when(Boolean(item.offset), el => el.overflow_hidden())
+                .child(div().absolute().top(-item.offset).w_full().h(item.row.height).child(content));
+            });
           })
           .size_full().track_scroll(this.scroll).on_item_click((key, cx) => this.activate(key, cx)))
         .child(Scrollbar.vertical("review-page-list").viewport_from_layout().absolute().inset_0())

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "../mods/review/page.js";
+import { buildPage, fileNavigation, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "../mods/review/page.js";
 import { desktopColors } from "../mods/review/desktop.js";
 import { errorText } from "../mods/review/model.js";
 import { submitToIdleAgent } from "../mods/review/delivery.js";
@@ -21,7 +21,7 @@ function harness({ root = "/repo", register = false, registry = {} } = {}) {
     const proxy = new Proxy({}, { get: (_, name) => (...args) => {
       if (deferred && String(name).startsWith("on_")) assert.fail("Handlers must not be registered in deferred code rows");
       if (name === "id") { id = args[0]; ids.push(id); styles.set(id, {}); }
-      if (id && ["opacity", "bg", "border_color", "disabled", "size", "visible", "w", "tooltip", "accessibility_label"].includes(name)) styles.get(id)[name] = args[0];
+      if (id && ["opacity", "bg", "border_color", "border_x", "border_t", "border_b", "rounded_t", "rounded_b", "disabled", "size", "visible", "w", "tooltip", "accessibility_label"].includes(name)) styles.get(id)[name] = args[0];
       if (id && name === "size_range") styles.get(id)[name] = args;
       if (id && name === "on_click") handlers.set(`${id}:click`, args[0]);
       if (id && name === "on_mouse_down") handlers.set(`${id}:down`, args[1]);
@@ -110,7 +110,7 @@ function harness({ root = "/repo", register = false, registry = {} } = {}) {
       return { code: 0, stdout: JSON.stringify({ ok: true, data }) };
     },
     hc: async args => { sends.push(args); return backend.failSend ? { code: 1, stderr: "agent became busy" } : { code: 0 }; },
-    buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel, desktopColors, errorText, submitToIdleAgent,
+    buildPage, fileNavigation, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel, desktopColors, errorText, submitToIdleAgent,
     filePaneKey, filePanePreferences, filePaneBounds,
   };
   vm.runInNewContext(source, sandbox);
@@ -444,6 +444,92 @@ test("list control clicks use the root hitbox, never per-row event registrations
   assert.ok(h.view.collapsed.has("src/main.rs"));
   assert.ok(!h.handlers.has("collapse-src/main.rs:click"));
   assert.ok(!h.handlers.has("card-src/main.rs:size"));
+});
+
+test("tree clicks top-align and outline the entire selected card, not its spacer or neighboring files", async () => {
+  const h = harness(); await h.load(); await h.load("new.rs"); h.render();
+  assert.ok(!h.ids.some(id => id.startsWith("card-outline:")), "no arbitrary initial selection");
+  await h.click("tree-new.rs"); h.render();
+  assert.deepEqual(h.scrolls.at(-1), [h.view.items.findIndex(item => item.key === "file:new.rs"), "top"]);
+  h.handlers.get("review-page:size")({ width: 832, height: 912 }, h.cx);
+  await h.click("tree-new.rs");
+  assert.deepEqual(h.scrolls.at(-1), [h.view.items.findIndex(item => item.key === "file-jump:new.rs"), "center"]);
+  for (const row of h.view.rows.filter(r => r.path === "new.rs" && r.kind !== "spacer")) {
+    const outline = h.styles.get(`card-outline:${row.key}`);
+    assert.equal(outline.border_color, desktopColors(true).accent);
+    assert.equal(outline.border_x, 2);
+    assert.equal(outline.border_t, row.kind === "file" ? 2 : undefined);
+    assert.equal(outline.border_b, row.kind === "end" ? 2 : undefined);
+  }
+  assert.ok(!h.styles.has("card-outline:space:new.rs"));
+  assert.ok(!h.styles.has("card-outline:file:src/main.rs"));
+  h.view.collapsed.add("src/main.rs");
+  await h.click("tree-src/main.rs");
+  assert.ok(!h.view.collapsed.has("src/main.rs"), "navigation expands collapsed/viewed cards");
+  h.styles.clear(); h.render();
+  assert.ok(!h.styles.has("card-outline:file:new.rs"), "old selection is no longer outlined");
+  h.view.toggleCollapse("src/main.rs", h.cx); h.render();
+  const header = h.styles.get("card-outline:file:src/main.rs");
+  assert.equal(header.border_t, 2); assert.equal(header.border_b, 2);
+  assert.equal(header.rounded_t, 6); assert.equal(header.rounded_b, 6);
+});
+
+test("the file outline survives scrolling, loading and inline comments without moving their anchors", async () => {
+  const h = harness(); await h.comment();
+  h.view.pick("src/main.rs", h.cx); await h.flush();
+  await h.click("edit-c1"); h.type("Unsaved text"); h.render();
+  const anchor = h.view.selection, scrolls = h.scrolls.length;
+  for (const row of h.view.rows.filter(r => r.path === "src/main.rs" && r.kind !== "spacer")) {
+    assert.equal(h.styles.get(`card-outline:${row.key}`).border_x, 2, `${row.kind} preserves the outline`);
+  }
+  h.view.pick("new.rs", h.cx); h.render();
+  h.handlers.get("review-hitbox:scroll")({}, h.cx); await h.flush(); h.render();
+  assert.equal(h.view.activePath, "new.rs");
+  assert.equal(h.view.jumpPath, null);
+  assert.equal(h.view.selection, anchor); assert.equal(h.view.note.value(), "Unsaved text");
+  assert.equal(h.styles.get("card-outline:file:new.rs").border_color, desktopColors(true).accent);
+  h.view.rebuild(h.cx);
+  assert.equal(h.scrolls.length, scrolls + 1, "manual scrolling cancels pending top pinning, not the outline");
+});
+
+test("navigation slices render an editor once per batch and remount its tail safely", async () => {
+  const h = harness(); await h.comment(); await h.click("edit-c1"); h.type("Keep this text");
+  let editor = h.view.rows.find(row => row.kind === "editor");
+  const before = h.view.rows.slice(0, h.view.rows.indexOf(editor)).reduce((sum, row) => sum + row.height, 0);
+  h.view.pageHeight = 2 * (before + 85);
+  h.view.pick("src/main.rs", h.cx); h.render();
+  editor = h.view.rows.find(row => row.kind === "editor");
+  const tail = h.view.items.findIndex(item => item.row === editor && item.offset > 0);
+  assert.ok(tail > 0, "the navigation midpoint bisects the editor");
+  const list = h.lists.at(-1);
+  for (const range of [{ start: 0, end: list.count }, { start: tail, end: tail + 1 }]) {
+    h.ids.length = 0; list.draw(range);
+    assert.equal(h.ids.filter(id => id === "inline-comment-editor").length, 1);
+    assert.equal(h.view.note.value(), "Keep this text");
+  }
+  assert.equal(h.view.byKey.get(h.view.items[tail].key), editor, "fragment clicks retain the original action/anchor row");
+});
+
+test("navigation through a sliced code line retains list-owned line hit testing", async () => {
+  const h = harness(); await h.load();
+  const row = h.view.rows.find(row => row.kind === "split" && row.new?.number === 2);
+  const before = h.view.rows.slice(0, h.view.rows.indexOf(row)).reduce((sum, row) => sum + row.height, 0);
+  h.view.pageHeight = 2 * (before + 11); h.view.pick("src/main.rs", h.cx); h.render();
+  const tail = h.view.items.find(item => item.row === row && item.offset > 0);
+  assert.ok(tail);
+  h.view.press = { x: 600, width: 800 }; h.lists.at(-1).click(tail.key, h.cx);
+  assert.equal(h.view.highlight.start, 2); assert.equal(h.view.highlight.side, "new");
+});
+
+test("page height changes recalculate the tail room without recapturing diffs", async () => {
+  const h = harness(); await h.load(); await h.load("new.rs"); h.render();
+  const calls = h.calls.length;
+  for (const height of [900, 400, 1200]) {
+    h.handlers.get("review-page:size")({ width: 832, height }, h.cx);
+    const start = h.view.rows.findIndex(row => row.key === "file:new.rs");
+    assert.equal(h.view.rows.slice(start).reduce((sum, row) => sum + row.height, 0), height - 12);
+  }
+  assert.equal(h.calls.length, calls);
 });
 
 test("tree navigation tracks a pending file load but stops pinning after user scroll or completion", async () => {

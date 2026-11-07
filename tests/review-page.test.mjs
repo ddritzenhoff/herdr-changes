@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { buildPage, fileTree, hitLine, hitCode, hitControl, controlWidths, layoutFor, commentFrame, anchorLabel } from "../mods/review/page.js";
+import { buildPage, fileNavigation, fileTree, hitLine, hitCode, hitControl, controlWidths, layoutFor, commentFrame, anchorLabel } from "../mods/review/page.js";
 
 const meta = { path: "src/a.rs", status: "M", fingerprint: "v1" };
 const data = { snapshot: "frozen", path: meta.path, diff: { rows: [
@@ -42,6 +42,43 @@ test("outdated comments retain their quote and can be edited inline without movi
   assert.equal(rows.find(r => r.kind === "editor").selection.snapshot, "previous");
   const orphan = buildPage([], new Map(), [stale], null);
   assert.equal(orphan[0].meta.status, "draft"); assert.equal(orphan.find(r => r.kind === "comment").outdated, true);
+});
+
+test("trailing room lets the last file reach the top for loaded, pending, error, draft and collapsed cards", () => {
+  const first = { path: "first.rs", status: "M" };
+  for (const map of [entries, new Map(), new Map([[meta.path, { error: "Unavailable" }]])]) {
+    for (const collapsed of [new Set(), new Set([meta.path])]) {
+      const rows = buildPage([first, meta], map, [], null, { viewportHeight: 600, collapsed });
+      const start = rows.findIndex(row => row.key === `file:${meta.path}`);
+      assert.equal(rows.slice(start).reduce((height, row) => height + row.height, 0), 600);
+      assert.ok(rows.at(-1).height >= 16);
+      assert.equal(rows.at(-1).key, `space:${meta.path}`);
+    }
+  }
+  const draftRows = buildPage([], entries, [draft], null, { viewportHeight: 800 });
+  assert.equal(draftRows.reduce((height, row) => height + row.height, 0), 800);
+  const tall = buildPage([meta], entries, [], null, { viewportHeight: 50 });
+  assert.equal(tall.at(-1).height, 16, "tall cards need only their normal inter-card gap");
+  assert.deepEqual(buildPage([], new Map(), [], null, { viewportHeight: 800 }), []);
+});
+
+test("centered navigation markers top-align files exactly without moving or losing source rows", () => {
+  for (const viewportHeight of [100, 200, 600, 1000]) for (const collapsed of [new Set(), new Set([meta.path])]) {
+    const rows = buildPage([{ path: "first.rs", status: "M" }, meta], entries, [draft], null, { viewportHeight, collapsed });
+    const { items, target } = fileNavigation(rows, meta.path, viewportHeight);
+    const origin = list => list.slice(0, list.findIndex(item => item.key === target)).reduce((sum, item) => sum + item.height, 0);
+    const headerTop = rows.slice(0, rows.findIndex(row => row.key === `file:${meta.path}`)).reduce((sum, row) => sum + row.height, 0);
+    assert.equal(origin(items) - viewportHeight / 2, headerTop, "native center strategy yields the exact header origin");
+    assert.equal(items.reduce((sum, item) => sum + item.height, 0), rows.reduce((sum, row) => sum + row.height, 0));
+    for (const row of rows) {
+      const fragments = items.filter(item => item.row === row);
+      assert.equal(fragments.reduce((sum, item) => sum + item.height, 0), row.height);
+      assert.ok(items.some(item => item.key === row.key), "all original control/code keys remain addressable");
+    }
+    assert.equal(new Set(items.map(item => item.key)).size, items.length);
+  }
+  assert.equal(fileNavigation([], "missing", 600).target, null);
+  assert.equal(fileNavigation(buildPage([meta], entries, [], null), meta.path, 0).target, null);
 });
 
 test("collapse hides code and drafts without deleting them; plus hitbox ignores code text and empty split halves", () => {

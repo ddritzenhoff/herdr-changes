@@ -10,7 +10,9 @@ beside the code, then send one feedback batch to your coding agent.
 
 - **Cmd+Shift+R** opens a review immediately beside the focused agent's tab.
   Reopening returns to the same tab. Repository and recipient stay pinned.
-- A changed-file tree navigates stacked, collapsible diff cards. Drag its right
+- A changed-file tree navigates stacked, collapsible diff cards. Clicking a file
+  expands it, aligns its header to the top (even the last file), and outlines
+  the entire card in blue until another file is selected. Drag the tree's right
   divider to resize it, or use Herdr's sidebar icon to collapse/restore it.
   The last expanded width and collapsed state persist across Review tabs and
   app restarts, independently of the repository.

@@ -56,8 +56,11 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
   collapsed state are saved in Herdr's local shared preferences across Review
   tabs, repositories and app restarts. No repository code or drafts are stored
   in this appearance preference. `review.toggle-files` also toggles the tree.
-- Collapse folders or click a file to jump to its card in the single scrolling
-  review page. Resizing/collapsing the tree never discards an open comment.
+- Collapse folders or click a file to expand its card and align its header to
+  the top of the single scrolling review page, including short final files.
+  The selected card has a continuous blue outline around its header, diff and
+  inline comments; it persists while scrolling until another file is selected.
+  Resizing/collapsing the tree never discards an open comment.
 - Click a line number or code line to give it a persistent blue outline.
   This visual selection is independent of the current comment editor's anchor.
   Native hover reveals a filled blue **+**, even while another line is selected.

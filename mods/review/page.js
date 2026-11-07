@@ -55,7 +55,7 @@ const surroundFor = (layout, row, side) => ({
 });
 
 // Pure flattened page data; no native elements, entities or handlers are cached.
-export function buildPage(files, entries, comments, selection, { width = 840, collapsed = new Set() } = {}) {
+export function buildPage(files, entries, comments, selection, { width = 840, viewportHeight = 0, collapsed = new Set() } = {}) {
   const rows = [], columns = Math.max(12, Math.floor((width - 32) / 7.3));
   const paths = new Set(files.map(f => f.path));
   const all = [...files, ...[...new Set(comments.map(c => c.path))].filter(p => !paths.has(p)).map(path => ({ path, status: "draft", fingerprint: "" }))];
@@ -112,7 +112,38 @@ export function buildPage(files, entries, comments, selection, { width = 840, co
     }
     rows.push({ kind: "spacer", key: `space:${path}`, path, height: 16 });
   }
+  // Native scrolling clamps at the content's end. Leave just enough room
+  // below the last card for even a short/collapsed final file to reach top.
+  const lastFile = rows.findLastIndex(row => row.kind === "file");
+  if (lastFile >= 0) {
+    const cardHeight = rows.slice(lastFile, -1).reduce((height, row) => height + row.height, 0);
+    rows.at(-1).height = Math.max(16, viewportHeight - cardHeight);
+  }
   return rows;
+}
+
+// The native handle's "top" strategy only ensures visibility. Center a
+// zero-height marker half a viewport after the header instead: its exact
+// position puts the header at top, regardless of the previous scroll offset.
+// Splitting the one intersected row changes no content coordinates or keys.
+export function fileNavigation(rows, path, viewportHeight) {
+  const items = rows.map(row => ({ key: row.key, height: row.height, row, offset: 0 }));
+  const start = rows.findIndex(row => row.key === `file:${path}`);
+  if (start < 0 || viewportHeight <= 0) return { items, target: null };
+  let remaining = viewportHeight / 2;
+  for (let i = start; i < items.length; i++) {
+    const item = items[i];
+    if (remaining > item.height) { remaining -= item.height; continue; }
+    const target = `file-jump:${path}`, marker = { key: target, height: 0, row: null };
+    const parts = [];
+    if (remaining > 0) parts.push({ ...item, height: remaining });
+    parts.push(marker);
+    if (remaining < item.height) parts.push({ ...item, key: remaining ? `navigation-tail:${item.key}` : item.key,
+      height: item.height - remaining, offset: remaining });
+    items.splice(i, 1, ...parts);
+    return { items, target };
+  }
+  return { items, target: null };
 }
 
 export function fileTree(files, folded = new Set()) {
