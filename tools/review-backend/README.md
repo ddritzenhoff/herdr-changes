@@ -70,11 +70,18 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 - File-tree navigation/scrolling preserves open comment text. Save or Cancel
   before opening a different comment, collapsing its file or sending feedback.
 
-The interface uses a virtual list for the whole page. Interactive headers,
-comments and the editor are retained nested views with their own handler
-lifetimes; only code elements are constructed by the deferred row renderer.
-The textarea is retained separately so scrolling does not destroy typed text.
-Nested asynchronous updates explicitly invalidate the retained page entity.
+The whole page uses one virtual list of freshly painted native elements. Row
+controls use a single list-owned handler with stable keys and fixed hit zones;
+comment/editor action strips are separate rows. No cached elements or nested
+JavaScript view entities are mounted in deferred rows: in Herdr 0.1.13 those
+mounts can be released offscreen, producing a blank pane on scrolling. The
+native textarea's **state**, not its row view, stays alive while offscreen.
+
+Visible-file demand is drained outside layout every 120 ms, with one backend
+request at a time and at most three queued files. This scheduler does not redraw
+an idle page or load diffs in hidden tabs. Wrapped/tokenized source rows are
+cached per file response, width and context. Unchanged manifest checks do not
+rebuild the page, and ordinary typing only repaints the native textarea.
 
 ## Background changes and saved drafts
 
@@ -155,6 +162,6 @@ herdr-app status
 ```
 
 Tests use temporary repositories and mocked agent transport. Native integration
-checks exercise stacked cards, a retained inline editor/save, and adjacent-tab
+checks exercise stacked cards, scrolling large diffs offscreen/back, inline editor/save, and adjacent-tab
 creation/reuse; they never send review text to a real agent. `review.submit`
 opens the preview from scripts while the mod is visible; it never sends by itself.

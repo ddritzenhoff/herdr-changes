@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { buildPage, fileTree, hitLine, layoutFor } from "../mods/review/page.js";
+import { buildPage, fileTree, hitLine, hitControl, controlWidths, layoutFor } from "../mods/review/page.js";
 
 const meta = { path: "src/a.rs", status: "M", fingerprint: "v1" };
 const data = { snapshot: "frozen", path: meta.path, diff: { rows: [
@@ -25,7 +25,7 @@ test("automatic layouts, stable line keys, inline editor and old-side draft plac
   assert.equal(layoutFor("A"), "unified"); assert.equal(layoutFor("D"), "unified"); assert.equal(layoutFor("M"), "split");
   const selection = { path: meta.path, snapshot: "frozen", side: "old", start: 2, end: 2 };
   const rows = buildPage([meta], entries, [draft], selection);
-  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "comment", "editor", "end", "spacer"]);
+  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "comment", "comment-body", "editor", "editor-actions", "end", "spacer"]);
   assert.equal(rows[2].key, "code:frozen:2:2");
   assert.equal(rows[3].outdated, false);
   const changedHunks = { ...data, diff: { rows: [{ kind: "hunk", text: "expanded context" }, ...data.diff.rows.slice(1)] } };
@@ -37,7 +37,9 @@ test("outdated comments retain their quote and can be edited inline without movi
   const rows = buildPage([meta], entries, [stale], { ...stale, commentId: stale.id });
   const index = rows.findIndex(r => r.kind === "comment");
   assert.equal(rows[index].outdated, true); assert.equal(rows[index].comment.quote, "old");
-  assert.equal(rows[index + 1].kind, "editor");
+  assert.equal(rows[index + 1].kind, "comment-body");
+  assert.equal(rows[index + 2].kind, "editor");
+  assert.equal(rows[index + 3].kind, "editor-actions");
   const orphan = buildPage([], new Map(), [stale], null);
   assert.equal(orphan[0].meta.status, "draft"); assert.equal(orphan.find(r => r.kind === "comment").outdated, true);
 });
@@ -50,6 +52,52 @@ test("collapse hides code and drafts without deleting them; plus hitbox ignores 
   assert.deepEqual(hitLine(row, { x: 410, width: 800 }), { side: "new", number: 2 });
   assert.equal(hitLine(row, { x: 600, width: 800 }), null);
   assert.equal(hitLine({ ...row, old: null }, { x: 10, width: 800 }), null);
+});
+
+test("virtual-row controls have bounded fixed hit zones, separate from code and text input", () => {
+  const hit = (kind, x, extra = {}) => hitControl({ kind, meta, ...extra }, { x, width: 800 });
+  assert.equal(hit("file", 20), "collapse");
+  assert.equal(hit("file", 800 - 12 - controlWidths.viewed / 2), "viewed");
+  assert.equal(hit("file", 100), null);
+  assert.equal(hit("file", 780, { meta: { status: "draft" } }), null);
+  assert.equal(hit("hunk", 750, { expand: true }), "expand");
+  assert.equal(hit("hunk", 750, { expand: false }), null);
+  assert.equal(hit("comment", 780), "delete");
+  assert.equal(hit("comment", 700), "edit");
+  assert.equal(hit("comment-body", 780), null);
+  assert.equal(hit("editor", 780), null);
+  assert.equal(hit("editor-actions", 780), "save");
+  assert.equal(hit("editor-actions", 650), "cancel");
+  assert.equal(hit("editor-actions", 672), null, "gap between buttons is not clickable");
+  assert.equal(hit("message", 780, { retry: true }), "retry");
+  assert.equal(hit("file", 795), null, "scrollbar lane cannot mark a file viewed");
+  assert.equal(hit("file", NaN), null);
+});
+
+test("wrapping is cached per file response, not redone for comments, progress or other files", () => {
+  const large = { ...data, diff: { rows: [{ kind: "hunk", text: "@@" }, ...Array.from({ length: 1000 }, (_, i) => [
+    { kind: "old", old_number: i + 1, text: "let previous = 1234567890;".repeat(3), spans: [] },
+    { kind: "new", new_number: i + 1, text: "let current = 1234567890;".repeat(3), spans: [] },
+  ]).flat()] } };
+  const entry = { data: large, meta, context: 3 }, map = new Map([[meta.path, entry]]);
+  const first = buildPage([meta], map, [], null).filter(r => r.kind === "split");
+  const second = buildPage([meta], map, [draft], { ...draft, commentId: draft.id }).filter(r => r.kind === "split");
+  assert.equal(first.length, 1000);
+  assert.ok(first.every((row, i) => row === second[i]), "all preprocessed source rows are reused");
+  const narrow = buildPage([meta], map, [], null, { width: 300 }).find(r => r.kind === "split");
+  assert.notEqual(narrow.old.wrapped, first[0].old.wrapped, "resize invalidates the wrapping cache");
+  entry.context = 12000;
+  assert.equal(buildPage([meta], map, [], null).find(r => r.kind === "hunk").expand, false);
+});
+
+test("repeated hunk annotations have unique virtual keys", () => {
+  const repeated = { ...data, diff: { rows: [
+    { kind: "hunk", text: "No newline at end of file" },
+    ...data.diff.rows,
+    { kind: "hunk", text: "No newline at end of file" },
+  ] } };
+  const rows = buildPage([meta], new Map([[meta.path, { data: repeated }]]), [], null);
+  assert.equal(new Set(rows.map(r => r.key)).size, rows.length);
 });
 
 const launcher = (await readFile(new URL("../mods/review-tabs/launcher.js", import.meta.url), "utf8"))

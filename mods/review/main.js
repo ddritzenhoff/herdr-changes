@@ -4,33 +4,25 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea, EditorState, Editor, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, terminals, props, shared, settings, nextCommand, window, hc } from "herdr";
 import { errorText } from "./model.js";
-import { buildPage, fileTree, hitLine, isCode } from "./page.js";
+import { buildPage, fileTree, hitLine, hitControl, isCode, controlWidths } from "./page.js";
 import { desktopColors } from "./desktop.js";
 import { submitToIdleAgent } from "./delivery.js";
 
 const icon = (name, size = 16) => svg(`mods/review/icons/${name}.svg`).size(size).flex_none();
-function button(id, text, action, enabled = true, primary = false, dispatch = null) {
+function button(id, text, action, enabled = true, primary = false) {
   const t = desktopColors(settings().dark !== false);
-  return div().id(id).h(28).px(10).flex_none().flex().items_center().justify_center().rounded(5).text_size(12)
+  const el = div().id(id).h(28).px(10).flex_none().flex().items_center().justify_center().rounded(5).text_size(12)
     .bg(primary ? t.accent : t.raised).text_color(primary ? "#ffffff" : t.foreground).border_1().border_color(primary ? t.accent : t.controlBorder)
     .when(!enabled, el => el.opacity(0.45))
-    .when(enabled, el => el.cursor_pointer().hover(s => s.bg(primary ? t.primaryHover : t.hover)))
-    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-    .on_click((_e, cx) => { cx.stop_propagation(); if (enabled) dispatch ? dispatch(action) : action(cx); }).child(text);
+    .when(enabled, el => el.cursor_pointer().hover(s => s.bg(primary ? t.primaryHover : t.hover)));
+  // Virtual rows are paint only. One list-owned handler routes their controls
+  // by stable row key and fixed hit zones; never mount entities inside a list.
+  if (action) el.on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+    .on_click((_e, cx) => { cx.stop_propagation(); if (enabled) action(cx); });
+  return el.child(text);
 }
 
-// Retained nested views give interactive rows their own render/handler lifetime.
-// Native elements themselves cannot be cached across deferred layout calls.
-class ReviewRow extends View {
-  init(p) { this.p = p; }
-  update(p) { this.p = p; }
-  render() {
-    const { owner, row } = this.p;
-    return owner.specialRow(row, desktopColors(settings().dark !== false), action => owner.post(action));
-  }
-}
-
-class ReviewPage extends View {
+export default class Review extends View {
   init(_props, cx) {
     const p = _props || props() || {}, focus = focused();
     const actor = agents().find(a => a.address === (p.agent || focus?.shown || focus?.terminal));
@@ -42,20 +34,16 @@ class ReviewPage extends View {
     this.files = []; this.comments = []; this.viewed = {}; this.entries = new Map(); this.rows = [];
     this.collapsed = new Set(); this.folded = new Set(); this.queue = []; this.deferred = new Map();
     this.busy = false; this.pumping = false; this.scanning = false; this.revision = 0; this.rpc = Promise.resolve();
-    this.specials = new Map(); this.actions = [];
-    cx.spawn(async cx => {
-      for (;;) {
-        if (!this.actions.length) await new Promise(resolve => { this.wake = resolve; });
-        if (this.closed) return;
-        while (this.actions.length) {
-          try { this.actions.shift()(cx); }
-          catch (e) { this.error = errorText(e); this.notify(cx); }
-        }
-      }
-    });
+    this.visiblePaths = [];
+    // The deferred renderer only records demand. A data scheduler drains it
+    // outside layout, at most three files ahead, with no idle redraws.
+    cx.timer.every(120, cx => this.loadVisible(cx));
     this.scroll = VirtualListScrollHandle.new();
     this.note = TextareaState.new({ placeholder: "Leave a comment…", rows: 4 });
-    this.note.on("change", (_e, cx) => { this.touchEditor(); this.notify(cx); });
+    this.note.on("change", (_e, cx) => {
+      const enabled = Boolean(this.note.value().trim());
+      if (enabled !== this.canSaveNote) { this.canSaveNote = enabled; this.notify(cx); }
+    });
     this.note.on("submit", (e, cx) => { if (e?.secondary) this.saveComment(cx); });
     this.previewEditor = EditorState.new({ value: "", readonly: true, line_numbers: false, folding: false, soft_wrap: true, font_size: 12 });
     cx.spawn(async cx => {
@@ -67,9 +55,7 @@ class ReviewPage extends View {
     cx.timer.every(15000, cx => {
       // No redraw timer: only the cheap manifest is checked, only in the
       // active review tab. Actual diff capture remains lazy and per-file.
-      const tab = spaces().find(s => s.id === this.space)?.tabs.find(t => t.active);
-      const ownTab = shared("review.tabs")?.[`${this.space}:${this.agent}`]?.tab || this.ownTab;
-      if (window().active && (!ownTab || tab?.id === ownTab)) this.scan(cx, true);
+      if (this.isActiveReview()) this.scan(cx, true);
     });
     this.ownTab = focus?.tab;
     if (this.agent?.includes("/")) this.error = "Review currently supports local agents only.";
@@ -91,46 +77,51 @@ class ReviewPage extends View {
     this.rpc = result.catch(() => {}); // A failed request must not poison later requests.
     return result;
   }
-  update(p) { this.self = p.self; }
-  notify(cx) { cx.notify(this.self); }
-  touchEditor() {
-    const row = this.byKey?.get("inline-editor");
-    if (row) this.specials.get(row.key)?.set_props({ row, owner: this });
+  notify(cx) { cx.notify(); }
+  isActiveReview() {
+    if (!window().active || this.agent?.includes("/")) return false;
+    const tab = spaces().find(s => s.id === this.space)?.tabs.find(t => t.active);
+    const ownTab = shared("review.tabs")?.[`${this.space}:${this.agent}`]?.tab || this.ownTab;
+    return !ownTab || !tab || tab.id === ownTab;
   }
-  post(action) {
-    if (this.closed) return;
-    this.actions.push(action);
-    if (this.wake) { const wake = this.wake; this.wake = null; wake(); }
+  loadVisible(cx) {
+    if (this.closed || this.busy || this.selection || this.preview || (!this.visiblePaths.length && !this.queue.length) || !this.isActiveReview()) return;
+    const paths = this.visiblePaths; this.visiblePaths = [];
+    if (paths.length) this.queue = this.queue.filter(path => paths.includes(path));
+    for (const path of paths) {
+      if (this.queue.length >= 3) break;
+      this.enqueue(path, cx);
+    }
+    this.pump(cx);
   }
-  rebuild(cx) {
+  rebuild(_cx) {
+    this.canSaveNote = Boolean(this.note.value().trim());
+    this.manifestSignature = JSON.stringify([this.root, this.base, this.files, this.comments, this.viewed]);
     this.rows = buildPage(this.files, this.entries, this.comments, this.selection, { width: this.width || 840, collapsed: this.collapsed });
     this.byKey = new Map(this.rows.map(r => [r.key, r]));
-    const keys = new Set();
-    for (const row of this.rows) {
-      if (isCode(row)) continue;
-      keys.add(row.key);
-      const entity = this.specials.get(row.key), p = { row, owner: this };
-      if (entity) entity.set_props(p);
-      else this.specials.set(row.key, cx.new(ReviewRow, p));
+    if (this.jumpPath) {
+      const entry = this.entries.get(this.jumpPath);
+      this.scrollTo(`file:${this.jumpPath}`, "top");
+      if (!entry?.meta || entry.error || (entry.data && !entry.changed)) this.jumpPath = null;
     }
-    for (const [key, entity] of this.specials) if (!keys.has(key)) { entity.release(); this.specials.delete(key); }
-    if (this.jumpPath) this.scrollTo(`file:${this.jumpPath}`, "top");
   }
   scrollTo(key, strategy = "center") {
     const index = this.rows.findIndex(r => r.key === key);
     if (index >= 0) this.scroll.scroll_to_item(index, strategy);
   }
   applyManifest(data, revision, cx) {
+    const comments = revision === this.revision ? data.comments : this.comments;
+    const signature = JSON.stringify([data.root, data.base, data.files, comments, data.viewed || {}]);
+    if (signature === this.manifestSignature) return false;
+    this.manifestSignature = signature;
     this.root = data.root; this.cwd = data.root; this.base = data.base;
-    this.files = data.files;
-    if (revision === this.revision) this.comments = data.comments;
+    this.files = data.files; this.comments = comments;
     const previous = this.viewed;
     this.viewed = data.viewed || {};
     for (const meta of this.files) {
       const entry = this.entries.get(meta.path) || { context: 3 };
       if (entry.fingerprint && entry.fingerprint !== meta.fingerprint) {
         entry.changed = true; entry.error = null;
-        if (entry.seen && !this.queue.includes(meta.path)) this.queue.push(meta.path);
         if (previous[meta.path]) this.collapsed.delete(meta.path);
       } else if (!this.entries.has(meta.path) && this.viewed[meta.path]) this.collapsed.add(meta.path);
       entry.meta = meta;
@@ -140,40 +131,42 @@ class ReviewPage extends View {
       entry.changed = true; entry.meta = null;
       if (!this.comments.some(c => c.path === path)) { this.entries.delete(path); this.collapsed.delete(path); }
     }
-    this.rebuild(cx);
+    this.rebuild(cx); return true;
   }
   scan(cx, quiet = false) {
     if (!this.cwd || this.scanning || this.busy || this.closed) return;
     this.scanning = true;
     const revision = this.revision;
     cx.spawn(async cx => {
+      let redraw = !quiet;
       try {
         const data = await this.call("scan");
         if (this.closed) return;
         if (this.selection || this.preview) {
           this.pendingManifest = { data, revision };
-          this.changedWhileEditing = Boolean(this.selection && data.files.find(f => f.path === this.selection.path)?.fingerprint !== this.entries.get(this.selection.path)?.meta?.fingerprint);
-          this.touchEditor();
-        } else { this.applyManifest(data, revision, cx); this.error = null; this.pump(cx); }
+          const changed = Boolean(this.selection && data.files.find(f => f.path === this.selection.path)?.fingerprint !== this.entries.get(this.selection.path)?.meta?.fingerprint);
+          if (changed !== this.changedWhileEditing) { this.changedWhileEditing = changed; redraw = true; }
+        } else if (this.applyManifest(data, revision, cx)) { this.error = null; this.pump(cx); redraw = true; }
       } catch (e) { if (!quiet) this.error = errorText(e); }
-      finally { this.scanning = false; if (!this.closed) this.notify(cx); }
+      finally { this.scanning = false; if (!this.closed && redraw) this.notify(cx); }
     });
-    this.notify(cx);
+    if (!quiet) this.notify(cx);
   }
   enqueue(path, cx, priority = false) {
     const entry = this.entries.get(path);
     if (!entry?.meta || entry.loading || entry.error || this.collapsed.has(path) || (entry.data && !entry.changed)) return;
     entry.seen = true;
     this.queue = this.queue.filter(p => p !== path);
-    priority ? this.queue.unshift(path) : this.queue.push(path);
+    if (priority) this.queue = [path, ...this.queue].slice(0, 3);
+    else if (this.queue.length < 3) this.queue.push(path);
     this.pump(cx);
   }
   pump(cx) {
-    if (this.pumping || this.busy || this.selection || this.preview || this.closed || !this.queue.length) return;
+    if (this.pumping || this.busy || this.selection || this.preview || this.closed || !this.queue.length || !this.isActiveReview()) return;
     this.pumping = true;
     cx.spawn(async cx => {
       try {
-        while (this.queue.length && !this.busy && !this.selection && !this.preview && !this.closed) {
+        while (this.queue.length && !this.busy && !this.selection && !this.preview && !this.closed && this.isActiveReview()) {
           const path = this.queue.shift(), entry = this.entries.get(path);
           if (!entry?.meta || this.collapsed.has(path) || (entry.data && !entry.changed)) continue;
           entry.loading = true;
@@ -182,7 +175,7 @@ class ReviewPage extends View {
             const data = await this.call("open", { path, base: this.base, context: entry.context });
             if (this.closed) return;
             if (this.selection || this.preview) this.deferred.set(path, { data, fingerprint });
-            else { entry.data = data; entry.fingerprint = fingerprint; entry.changed = entry.meta.fingerprint !== fingerprint; entry.error = null; }
+            else { entry.data = data; entry.fingerprint = fingerprint; entry.changed = entry.meta?.fingerprint !== fingerprint; entry.error = null; }
           } catch (e) { entry.error = errorText(e); }
           finally { entry.loading = false; }
           if (!this.selection && !this.preview) this.rebuild(cx);
@@ -230,6 +223,22 @@ class ReviewPage extends View {
       checked ? this.collapsed.add(path) : this.collapsed.delete(path);
       this.rebuild(cx); this.enqueue(path, cx);
     });
+  }
+  activate(key, cx) {
+    if (this.busy) return;
+    const row = this.byKey.get(key);
+    if (!row) return; // An event queued before a background replacement.
+    if (isCode(row)) { this.select(key, cx); return; }
+    switch (hitControl(row, this.press)) {
+      case "collapse": this.toggleCollapse(row.path, cx); break;
+      case "viewed": this.toggleViewed(row.path, cx); break;
+      case "expand": if (!this.selection) this.expandContext(row, cx); break;
+      case "edit": this.editComment(row.comment.id, cx); break;
+      case "delete": this.deleteComment(row.comment.id, cx); break;
+      case "cancel": this.cancelComment(cx); break;
+      case "save": this.saveComment(cx); break;
+      case "retry": this.entries.get(row.path).error = null; this.enqueue(row.path, cx, true); this.rebuild(cx); this.notify(cx); break;
+    }
   }
   select(key, cx) {
     if (this.busy) return;
@@ -343,56 +352,52 @@ class ReviewPage extends View {
     return row.kind === "split" ? box.child(this.codeCell(row.old, "old", row, t)).child(this.codeCell(row.new, "new", row, t))
       : box.child(this.codeCell(row, row.side, row, t));
   }
-  editorRow(row, t, dispatch) {
-    const s = this.selection;
-    const actionButton = (id, text, action, enabled = true, primary = false) => button(id, text, action, enabled, primary, dispatch);
-    return v_flex().id("inline-comment-editor").h(row.height).px(14).py(10).gap(8).bg(t.comment).border(1).border_color(t.accent)
+  editorRow(row, t) {
+    const s = row.selection;
+    return v_flex().id("inline-comment-editor").h(row.height).px(14).py(10).gap(8).bg(t.comment).border(1).border_b(0).border_color(t.accent)
       .child(h_flex().gap(8).items_center()
         .child(icon("comment").text_color(t.ansi4))
         .child(div().font_semibold().child(`${s.commentId ? "Edit comment" : "Comment"} · ${s.side} lines ${s.start}–${s.end}`))
         .when(this.changedWhileEditing, el => el.child(div().text_size(10).text_color(t.blocked).child("File changed · original snapshot retained"))))
       .child(div().flex_1().min_h(0).px(10).py(7).bg(t.input).rounded(5).border_1().border_color(t.controlBorder)
-        .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Textarea.new(this.note).size_full().text_size(13)))
-      .child(h_flex().gap(8).justify_end()
-        .child(actionButton("comment-cancel", "Cancel", cx => this.cancelComment(cx), !this.busy))
-        .child(actionButton("comment-save", s.commentId ? "Save changes" : "Add comment", cx => this.saveComment(cx), !this.busy && Boolean(this.note.value().trim()), true)));
+        .child(Textarea.new(this.note).size_full().text_size(13)));
   }
-  specialRow(row, t, dispatch) {
-    const actionButton = (id, text, action, enabled = true, primary = false) => button(id, text, action, enabled, primary, dispatch);
+  specialRow(row, t) {
+    const control = (id, text, name, enabled = true, primary = false) => button(id, text, null, enabled, primary).w(controlWidths[name]).px(0);
     const shell = () => v_flex().h(row.height).w_full().bg(t.background).border_x(1).border_color(t.border);
-    if (row.kind === "editor") return this.editorRow(row, t, dispatch);
+    if (row.kind === "editor") return this.editorRow(row, t);
+    if (row.kind === "editor-actions") return h_flex().h(row.height).px(14).pb(10).gap(8).justify_end().bg(t.comment).border(1).border_t(0).border_color(t.accent)
+      .child(control("comment-cancel", "Cancel", "cancel", !this.busy))
+      .child(control("comment-save", row.selection.commentId ? "Save changes" : "Add comment", "save", !this.busy && Boolean(this.note.value().trim()), true));
     if (row.kind === "file") {
       const checked = Boolean(this.viewed[row.path]), entry = row.entry;
       const add = row.meta.add ?? entry?.data?.add, del = row.meta.del ?? entry?.data?.del;
       return h_flex().id(`card-${row.path}`).h(row.height).px(12).gap(9).items_center().bg(t.raised).rounded_t(6).border(1).border_color(t.border)
-        .on_size_change(() => dispatch(cx => this.enqueue(row.path, cx)))
-        .child(actionButton(`collapse-${row.path}`, this.collapsed.has(row.path) ? "▸" : "▾", cx => this.toggleCollapse(row.path, cx)).px(5))
+        .child(control(`collapse-${row.path}`, this.collapsed.has(row.path) ? "▸" : "▾", "collapse", !this.busy))
         .child(div().flex_1().min_w(0).truncate().font_semibold().child(row.path))
         .when(add !== null && add !== undefined, el => el.child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)))
         .when(del !== null && del !== undefined, el => el.child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
         .when(Boolean(entry?.changed || entry?.data?.stale || row.meta.status === "draft"), el => el.child(div().text_size(10).text_color(t.blocked).child(row.meta.status === "draft" ? "Outdated draft context" : "Changed since capture")))
-        .when(row.meta.status !== "draft", el => el.child(actionButton(`viewed-${row.path}`, checked ? "☑ Viewed" : "☐ Viewed", cx => this.toggleViewed(row.path, cx), !this.busy).text_size(11)));
+        .when(row.meta.status !== "draft", el => el.child(control(`viewed-${row.path}`, checked ? "☑ Viewed" : "☐ Viewed", "viewed", !this.busy).text_size(11)));
     }
     if (row.kind === "hunk") return h_flex().h(row.height).px(12).gap(8).items_center().bg(t.hunk).border_x(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().font_family(settings().font_family || "JetBrains Mono").text_size(11).text_color(t.dim).child(row.text))
-      .when(row.expand, el => el.child(actionButton(`expand-${row.key}`, "Expand context", cx => this.expandContext(row, cx), !this.busy && !this.selection).h(23).text_size(10)));
-    if (row.kind === "comment") return shell().p(12).gap(6).border_y(1).border_color(t.commentBorder).bg(t.comment)
-      .child(h_flex().gap(6).items_center().child(div().font_semibold().child("You"))
-        .child(div().text_size(10).text_color(row.outdated ? t.blocked : t.muted).child(row.outdated ? `Draft · outdated ${row.comment.side} lines ${row.comment.start}–${row.comment.end}` : "Draft"))
-        .child(div().flex_1())
-        .child(actionButton(`edit-${row.comment.id}`, "Edit", cx => this.editComment(row.comment.id, cx), !this.busy).h(22).text_size(10))
-        .child(actionButton(`delete-${row.comment.id}`, "Delete", cx => this.deleteComment(row.comment.id, cx), !this.busy).h(22).text_size(10)))
+      .when(row.expand, el => el.child(control(`expand-${row.key}`, "Expand context", "expand", !this.busy && !this.selection).h(23).text_size(10)));
+    if (row.kind === "comment") return h_flex().h(row.height).px(12).gap(6).items_center().border(1).border_color(t.commentBorder).bg(t.comment)
+      .child(div().font_semibold().child("You"))
+      .child(div().text_size(10).text_color(row.outdated ? t.blocked : t.muted).child(row.outdated ? `Draft · outdated ${row.comment.side} lines ${row.comment.start}–${row.comment.end}` : "Draft"))
+      .child(div().flex_1())
+      .child(control(`edit-${row.comment.id}`, "Edit", "edit", !this.busy).h(22).text_size(10))
+      .child(control(`delete-${row.comment.id}`, "Delete", "delete", !this.busy).h(22).text_size(10));
+    if (row.kind === "comment-body") return shell().px(12).pt(4).pb(10).border_b(1).border_color(t.commentBorder).bg(t.comment)
       .child(v_flex().id(`comment-body-${row.comment.id}`).flex_1().min_h(0).gap(6).overflow_y_scrollbar()
         .when(row.outdated, el => el.child(div().p(7).bg(t.hunk).font_family(settings().font_family || "JetBrains Mono").text_size(11).whitespace_normal().child(row.comment.quote)))
         .child(div().text_size(13).whitespace_normal().child(row.comment.body)));
     if (row.kind === "end") return shell().border_b(1).rounded_b(6);
     if (row.kind === "spacer") return div().h(row.height);
-    return shell().id(row.key).px(12).py(9).gap(7)
-      .when(row.load, el => el.on_size_change(() => dispatch(cx => this.enqueue(row.path, cx))))
-      .child(div().text_size(11).text_color(t.muted).whitespace_normal().child(row.text))
-      .when(Boolean(this.entries.get(row.path)?.error), el => el.child(actionButton(`retry-${row.path}`, "Try again", cx => {
-        this.entries.get(row.path).error = null; this.enqueue(row.path, cx, true); this.rebuild(cx); this.notify(cx);
-      }, !this.busy).h(23)));
+    return h_flex().h(row.height).px(12).py(9).gap(7).items_center().bg(t.background).border_x(1).border_color(t.border)
+      .child(div().flex_1().min_w(0).text_size(11).text_color(t.muted).whitespace_normal().child(row.text))
+      .when(row.retry, el => el.child(control(`retry-${row.path}`, "Try again", "retry", !this.busy).h(23)));
   }
   sidebar(t) {
     return v_flex().w(240).h_full().flex_none().min_h(0).border_r(1).border_color(t.border).bg(t.sidebar)
@@ -415,8 +420,9 @@ class ReviewPage extends View {
       .when(!this.files.length, el => el.child(div().p(12).text_size(11).text_color(t.muted).child(this.scanning ? "Loading changes…" : "No uncommitted changes")));
   }
   page(t) {
-    // Retained row entities render interactive content in their own view scope.
-    // The deferred renderer only creates fresh wrappers and pure code elements.
+    const rows = this.rows;
+    // Keep a coherent list version for the whole native layout pass. Nothing
+    // here owns a JS row entity, event handler, or cached native element.
     return v_flex().id("review-page").flex_1().h_full().min_w(0).min_h(0).px(16).pt(12).bg(t.canvas)
       .on_size_change((size, cx) => {
         const width = Math.max(200, size.width - 32);
@@ -424,10 +430,14 @@ class ReviewPage extends View {
       })
       .child(div().id("review-hitbox").flex_1().w_full().min_h(0).relative()
         .on_mouse_down("left", e => { if (e.local_position && e.bounds) this.press = { x: e.local_position.x, width: e.bounds.width, shift: Boolean(e.modifiers?.shift) }; })
-        .on_scroll_wheel(() => { this.jumpPath = null; })
-        .child(v_virtual_list("review-page-list", this.rows.length, this.rows.map(row => row.height), i => this.rows[i].key,
-          range => this.rows.slice(range.start, range.end).map(row => isCode(row) ? this.codeRow(row, t) : div().h(row.height).w_full().child(this.specials.get(row.key))))
-          .size_full().track_scroll(this.scroll).on_item_click((key, cx) => this.select(key, cx)))
+        .when(Boolean(this.jumpPath), el => el.on_scroll_wheel(() => { this.jumpPath = null; }))
+        .child(v_virtual_list("review-page-list", rows.length, rows.map(row => row.height), i => rows[i].key,
+          range => {
+            const visible = rows.slice(range.start, range.end);
+            if (rows === this.rows) this.visiblePaths = [...new Set(visible.map(row => row.path))];
+            return visible.map(row => isCode(row) ? this.codeRow(row, t) : this.specialRow(row, t));
+          })
+          .size_full().track_scroll(this.scroll).on_item_click((key, cx) => this.activate(key, cx)))
         .child(Scrollbar.vertical("review-page-list").viewport_from_layout().absolute().inset_0())
         .when(!this.rows.length, el => el.child(v_flex().absolute().inset_0().items_center().justify_center().gap(8).text_color(t.muted)
           .child(div().text_size(17).child(this.scanning ? "Loading changes…" : "Nothing to review"))
@@ -460,13 +470,4 @@ class ReviewPage extends View {
           .child(button("review-preview", `Review & send${this.comments.length ? ` (${this.comments.length})` : ""}`, cx => this.prepare(cx), !this.busy && !this.selection && this.comments.length > 0, true))));
   }
   close() { this.closed = true; }
-}
-
-export default class Review extends View {
-  init(p, cx) {
-    this.page = cx.new(ReviewPage, p);
-    this.page.set_props({ ...(p || {}), self: this.page });
-  }
-  render() { return this.page; }
-  close() { this.page.release(); }
 }
