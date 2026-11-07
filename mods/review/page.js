@@ -13,14 +13,19 @@ function fileRows(data, meta, entry, width) {
   const cached = wrappedFiles.get(data);
   if (cached?.signature === signature) return cached.rows;
   const source = layout === "split" ? splitRows(data, []) : data.diff.rows;
-  let hasContextControl = false;
-  const rows = source.map((original, index) => {
+  const rows = source.flatMap((original, index) => {
     const row = { ...original, path: meta.path, snapshot: data.snapshot, layout, readOnly: meta.status === "draft", height: 22 };
     if (isCode(row)) row.key = `code:${data.snapshot}:${numberOn(row, "old") || ""}:${numberOn(row, "new") || ""}`;
     else row.key = `hunk:${data.snapshot}:${index}:${row.text}`;
     if (row.kind === "hunk") {
-      row.expand = meta.status !== "A" && meta.status !== "D" && (entry.context || 3) < 12000 && !hasContextControl;
-      hasContextControl = true; row.height = 29;
+      // Separate keys for the stacked gutter arrows keep hit testing x-only:
+      // down extends the preceding hunk; up extends the following hunk.
+      if (row.gap && !row.readOnly && layout === "split") {
+        const directions = [...(row.gap.before ? ["down"] : []), ...(row.gap.after ? ["up"] : [])];
+        return directions.map((expand, i) => ({ ...row, expand, text: i ? "" : row.text,
+          key: `gap:${data.snapshot}:${row.gap.old_start}:${row.gap.new_start}:${expand}` }));
+      }
+      row.height = 29;
     } else if (row.kind === "split") {
       const count = Math.max(12, Math.floor((width / 2 - 91) / 7.3));
       for (const side of ["old", "new"]) if (row[side]) row[side] = { ...row[side], wrapped: wrapSegments(row[side].text, row[side].spans, count) };
@@ -136,7 +141,7 @@ export function fileTree(files, folded = new Set()) {
 
 // Coordinates belong to the full page hitbox, which has no horizontal padding.
 // The list delegates clicks by stable row key, avoiding listeners per code line.
-export const controlWidths = { collapse: 28, viewed: 92, expand: 123, edit: 48, delete: 56, cancel: 68, save: 110, retry: 88 };
+export const controlWidths = { collapse: 28, viewed: 92, expand: 74, edit: 48, delete: 56, cancel: 68, save: 110, retry: 88 };
 export function hitControl(row, press) {
   if (!press || !Number.isFinite(press.x) || !Number.isFinite(press.width) || press.width <= 0) return null;
   const x = press.x - (row.frame?.x || 0), width = row.frame?.width ?? press.width;
@@ -147,7 +152,7 @@ export function hitControl(row, press) {
     if (x >= 12 && x <= 12 + controlWidths.collapse) return "collapse";
     if (row.meta.status !== "draft" && right("viewed")) return "viewed";
   }
-  if (row.kind === "hunk" && row.expand && right("expand")) return "expand";
+  if (row.kind === "hunk" && row.expand && x >= 1 && x <= controlWidths.expand) return "expand";
   if (row.kind === "comment") {
     if (right("delete")) return "delete";
     if (right("edit", controlWidths.delete + 6)) return "edit";

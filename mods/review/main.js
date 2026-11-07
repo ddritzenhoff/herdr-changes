@@ -344,11 +344,17 @@ export default class Review extends View {
   expandContext(row, cx) {
     if (this.selection) { this.error = "Save or cancel the open comment before expanding context."; this.notify(cx); return; }
     const entry = this.entries.get(row.path);
-    if (!entry?.data) return;
-    this.operation(cx, async cx => {
-      const context = Math.min(12000, (entry.context || 3) + 10);
-      entry.data = await this.call("snapshot", { snapshot: entry.data.snapshot, context });
-      entry.context = context; this.rebuild(cx); this.scrollTo(`file:${row.path}`, "top");
+    if (!entry?.data || !row.gap || !row.expand || row.snapshot !== entry.data.snapshot) return;
+    const data = entry.data, count = Math.min(10, row.gap.count);
+    const offset = row.expand === "up" ? row.gap.count - count : 0;
+    const range = { old_start: row.gap.old_start + offset, new_start: row.gap.new_start + offset, count };
+    this.jumpPath = null;
+    this.operation(cx, async () => {
+      const expanded = await this.call("snapshot", { snapshot: data.snapshot, context: data.context ?? 3, reveal: [...(data.reveal || []), range] });
+      // An in-flight fresh capture wins over expansion of an older snapshot.
+      if (entry.data === data) entry.data = expanded;
+      // Stable code keys let the native list retain its viewport. Never jump
+      // to the file header when revealing code halfway down a long file.
     });
   }
   target() { return agents().find(a => a.address === this.agent && a.space === this.space); }
@@ -453,9 +459,14 @@ export default class Review extends View {
         .when(Boolean(entry?.changed || entry?.data?.stale || row.meta.status === "draft"), el => el.child(div().text_size(10).text_color(t.blocked).child(row.meta.status === "draft" ? "Outdated draft context" : "Changed since capture")))
         .when(row.meta.status !== "draft", el => el.child(this.viewedControl(row.path, t)));
     }
-    if (row.kind === "hunk") return h_flex().h(row.height).px(12).gap(8).items_center().bg(t.hunk).border_x(1).border_color(t.border)
-      .child(div().flex_1().min_w(0).truncate().font_family(settings().font_family || "JetBrains Mono").text_size(11).text_color(t.dim).child(row.text))
-      .when(row.expand, el => el.child(control(`expand-${row.key}`, "Expand context", "expand", !this.busy && !this.selection).h(23).text_size(10)));
+    if (row.kind === "hunk") return h_flex().h(row.height).items_center().bg(t.hunk).border_x(1).border_color(t.border)
+      .when(Boolean(row.expand), el => el.child(div().id(`expand-${row.key}`).w(controlWidths.expand).h_full().flex_none().flex().items_center().justify_center()
+        .bg(t.selected).text_color(t.dim).role("button").accessibility_label(`Expand ${Math.min(10, row.gap.count)} lines ${row.expand === "up" ? "above" : "below"}`)
+        .disabled(this.busy || Boolean(this.selection))
+        .when(!this.busy && !this.selection, el => el.cursor_pointer().hover(s => s.bg(t.accent).text_color("#ffffff")))
+        .tooltip(`Expand ${Math.min(10, row.gap.count)} lines ${row.expand === "up" ? "above" : "below"}`)
+        .child(icon(`expand-${row.expand}`, 18))))
+      .child(div().flex_1().min_w(0).px(12).truncate().font_family(settings().font_family || "JetBrains Mono").text_size(11).text_color(t.dim).child(row.text));
     if (row.kind === "comment") return this.bubbleRow(row, t, h_flex().h(row.height).px(12).gap(6).items_center().rounded_t(7).border(1).border_color(t.commentBorder).bg(t.commentHeader)
       .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(row.outdated ? t.blocked : t.muted).child(`${row.outdated ? "Outdated · " : ""}Comment on ${anchorLabel(row.comment)}`))
       .child(control(`edit-${row.comment.id}`, "Edit", "edit", !this.busy).h(22).text_size(10))

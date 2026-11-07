@@ -14,6 +14,21 @@ pub(super) struct Span {
     end: usize,
     highlight: String,
 }
+// A range of identical lines in the two frozen sides, never working-tree text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContextRange {
+    old_start: usize,
+    new_start: usize,
+    count: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+struct Gap {
+    #[serde(flatten)]
+    range: ContextRange,
+    before: bool,
+    after: bool,
+}
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Row {
     pub(super) kind: String,
@@ -23,6 +38,8 @@ pub(super) struct Row {
     new_number: Option<usize>,
     text: String,
     spans: Vec<Span>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gap: Option<Gap>,
 }
 #[derive(Serialize)]
 pub(super) struct Rendered {
@@ -64,6 +81,7 @@ fn row(kind: &str, old: Option<usize>, new: Option<usize>, text: &str, spans: Ve
         new_number: new,
         text: text.into(),
         spans,
+        gap: None,
     }
 }
 fn files(s: &Snapshot) -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
@@ -80,7 +98,7 @@ fn files(s: &Snapshot) -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
     fs::write(&new, &s.new).map_err(|e| e.to_string())?;
     Ok((dir, old, new))
 }
-fn textual(s: &Snapshot, notice: Option<String>, context: usize) -> Result<Rendered> {
+fn textual(s: &Snapshot, notice: Option<String>) -> Result<Rendered> {
     let (dir, old, new) = files(s)?;
     let r = output(git_at(
         dir.path(),
@@ -90,7 +108,7 @@ fn textual(s: &Snapshot, notice: Option<String>, context: usize) -> Result<Rende
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
-            &format!("--unified={context}"),
+            &format!("--unified={MAX_LINES}"),
             "--",
             old.to_str().ok_or("Invalid temp path")?,
             new.to_str().ok_or("Invalid temp path")?,
@@ -103,7 +121,12 @@ fn textual(s: &Snapshot, notice: Option<String>, context: usize) -> Result<Rende
     Ok(Rendered {
         engine: "Git text diff".into(),
         notice,
-        rows: parse_patch(&patch)?,
+        // Request complete context once, then compact both engines identically.
+        // Keep newline annotations, but regenerate range headers after folding.
+        rows: parse_patch(&patch)?
+            .into_iter()
+            .filter(|r| r.kind != "hunk" || !r.text.starts_with("@@ "))
+            .collect(),
     })
 }
 fn parse_patch(patch: &str) -> Result<Vec<Row>> {
@@ -143,7 +166,7 @@ fn parse_patch(patch: &str) -> Result<Vec<Row>> {
     }
     Ok(rows)
 }
-fn difft(s: &Snapshot, context: usize) -> Result<Rendered> {
+fn difft(s: &Snapshot) -> Result<Rendered> {
     let binary = std::env::var("HERDR_REVIEW_DIFFT").unwrap_or_else(|_| "difft".into());
     let mut version_cmd = Command::new(&binary);
     version_cmd.arg("--version");
@@ -206,7 +229,6 @@ fn difft(s: &Snapshot, context: usize) -> Result<Rendered> {
                 "No structural changes. Showing text changes (including formatting) instead."
                     .into(),
             ),
-            context,
         );
     }
     // Created/deleted files have no JSON token spans or alignment in 0.72.0.
@@ -214,7 +236,6 @@ fn difft(s: &Snapshot, context: usize) -> Result<Rendered> {
         return textual(
             s,
             Some("Difftastic supplied no alignment for this file; showing text diff.".into()),
-            context,
         );
     };
     let mut lhs = HashMap::new();
@@ -274,69 +295,136 @@ fn difft(s: &Snapshot, context: usize) -> Result<Rendered> {
         }
     }
     if !rows.iter().any(|r| r.kind == "old" || r.kind == "new") {
-        return textual(
-            s,
-            Some("No structural hunks; showing text changes.".into()),
-            context,
-        );
-    }
-    let mut keep = vec![false; rows.len()];
-    for (i, r) in rows.iter().enumerate() {
-        if r.kind == "old" || r.kind == "new" {
-            let end = rows.len().min(i + context + 1);
-            keep[i.saturating_sub(context)..end].fill(true);
-        }
-    }
-    let mut compact = Vec::new();
-    let mut gap = true;
-    for (i, r) in rows.into_iter().enumerate() {
-        if !keep[i] {
-            gap = true;
-            continue;
-        }
-        if gap {
-            compact.push(row(
-                "hunk",
-                None,
-                None,
-                &format!(
-                    "@@ old {} · new {} @@",
-                    r.old_number.unwrap_or(0),
-                    r.new_number.unwrap_or(0)
-                ),
-                vec![],
-            ));
-            gap = false;
-        }
-        compact.push(r);
+        return textual(s, Some("No structural hunks; showing text changes.".into()));
     }
     Ok(Rendered {
         engine: format!("Difftastic {DIFFT_VERSION}"),
         notice: None,
-        rows: compact,
+        rows,
     })
 }
-pub(super) fn render(s: &Snapshot, mode: &str, context: usize) -> Result<Rendered> {
+fn compact(rows: Vec<Row>, context: usize, reveal: &[ContextRange]) -> Vec<Row> {
+    let mut keep = vec![false; rows.len()];
+    for (i, r) in rows.iter().enumerate() {
+        if r.kind != "context" {
+            let end = rows.len().min(i + context + 1);
+            keep[i.saturating_sub(context)..end].fill(true);
+        } else if reveal.iter().any(|range| {
+            r.old_number.zip(r.new_number).is_some_and(|(old, new)| {
+                old.checked_sub(range.old_start)
+                    .zip(new.checked_sub(range.new_start))
+                    .is_some_and(|(a, b)| a == b && a < range.count)
+            })
+        }) {
+            keep[i] = true;
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let r = &rows[i];
+        if keep[i] {
+            if i == 0 {
+                out.push(row(
+                    "hunk",
+                    None,
+                    None,
+                    &format!(
+                        "@@ old {} · new {} @@",
+                        r.old_number.unwrap_or(0),
+                        r.new_number.unwrap_or(0)
+                    ),
+                    vec![],
+                ));
+            }
+            out.push(r.clone());
+            i += 1;
+        } else {
+            let start = i;
+            while i < rows.len() && !keep[i] {
+                i += 1;
+            }
+            let count = i - start;
+            let mut header = row("hunk", None, None, &format!("{count} hidden lines"), vec![]);
+            header.gap = Some(Gap {
+                range: ContextRange {
+                    old_start: r.old_number.expect("unchanged old line"),
+                    new_start: r.new_number.expect("unchanged new line"),
+                    count,
+                },
+                before: start > 0,
+                after: i < rows.len(),
+            });
+            out.push(header);
+        }
+    }
+    out
+}
+
+pub(super) fn context_ranges(
+    s: &Snapshot,
+    mut reveal: Vec<ContextRange>,
+) -> Result<Vec<ContextRange>> {
+    let old_lines = s.old.lines().count();
+    let new_lines = s.new.lines().count();
+    if reveal.len() > MAX_LINES
+        || reveal.iter().any(|r| {
+            r.old_start == 0
+                || r.new_start == 0
+                || r.count == 0
+                || r.old_start
+                    .checked_add(r.count - 1)
+                    .is_none_or(|end| end > old_lines)
+                || r.new_start
+                    .checked_add(r.count - 1)
+                    .is_none_or(|end| end > new_lines)
+        })
+    {
+        return Err("Context range is outside the snapshot".into());
+    }
+    // Repeated clicks grow a few intervals, not an ever-growing request log.
+    reveal.sort_by_key(|r| (r.old_start, r.new_start));
+    let mut merged: Vec<ContextRange> = Vec::new();
+    for range in reveal {
+        if let Some(last) = merged.last_mut() {
+            if range.old_start <= last.old_start + last.count
+                && range.old_start + last.new_start == range.new_start + last.old_start
+            {
+                last.count = last
+                    .count
+                    .max(range.old_start + range.count - last.old_start);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    Ok(merged)
+}
+
+pub(super) fn render(
+    s: &Snapshot,
+    mode: &str,
+    context: usize,
+    reveal: &[ContextRange],
+) -> Result<Rendered> {
     if !["text", "structural"].contains(&mode) {
         return Err("Mode must be structural or text".into());
     }
     // There is nothing structural to align in wholly added/deleted files.
-    if s.old.is_empty() || s.new.is_empty() {
-        return textual(s, None, context);
-    }
-    match mode {
-        "text" => textual(s, None, context),
-        "structural" => difft(s, context).or_else(|e| {
+    let mut rendered = if mode == "text" || s.old.is_empty() || s.new.is_empty() {
+        textual(s, None)?
+    } else {
+        difft(s).or_else(|e| {
             textual(
                 s,
                 Some(format!(
                     "Structural diff unavailable: {e}. Showing text diff."
                 )),
-                context,
             )
-        }),
-        _ => Err("Mode must be structural or text".into()),
-    }
+        })?
+    };
+    rendered.rows = compact(rendered.rows, context, reveal);
+    Ok(rendered)
 }
 
 #[cfg(test)]

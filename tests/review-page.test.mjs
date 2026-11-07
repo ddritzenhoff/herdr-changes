@@ -60,8 +60,9 @@ test("virtual-row controls have bounded fixed hit zones, separate from code and 
   assert.equal(hit("file", 800 - 12 - controlWidths.viewed / 2), "viewed");
   assert.equal(hit("file", 100), null);
   assert.equal(hit("file", 780, { meta: { status: "draft" } }), null);
-  assert.equal(hit("hunk", 750, { expand: true }), "expand");
-  assert.equal(hit("hunk", 750, { expand: false }), null);
+  assert.equal(hit("hunk", 35, { expand: "up" }), "expand");
+  assert.equal(hit("hunk", 750, { expand: "up" }), null);
+  assert.equal(hit("hunk", 35, { expand: false }), null);
   assert.equal(hit("comment", 780), "delete");
   assert.equal(hit("comment", 700), "edit");
   assert.equal(hit("comment-body", 780), null);
@@ -86,8 +87,7 @@ test("wrapping is cached per file response, not redone for comments, progress or
   assert.ok(first.every((row, i) => row === second[i]), "all preprocessed source rows are reused");
   const narrow = buildPage([meta], map, [], null, { width: 300 }).find(r => r.kind === "split");
   assert.notEqual(narrow.old.wrapped, first[0].old.wrapped, "resize invalidates the wrapping cache");
-  entry.context = 12000;
-  assert.equal(buildPage([meta], map, [], null).find(r => r.kind === "hunk").expand, false);
+  assert.ok(!buildPage([meta], map, [], null).find(r => r.kind === "hunk").expand, "a range header without hidden lines has no expansion control");
 });
 
 test("comment cards are inset, capped and align with their old/new code lane", () => {
@@ -139,6 +139,28 @@ test("repeated hunk annotations have unique virtual keys", () => {
   ] } };
   const rows = buildPage([meta], new Map([[meta.path, { data: repeated }]]), [], null);
   assert.equal(new Set(rows.map(r => r.key)).size, rows.length);
+});
+
+test("hidden context has top/bottom arrows and separately keyed, stacked arrows between hunks", () => {
+  const gap = (old_start, new_start, count, before, after) => ({ kind: "hunk", text: `${count} hidden lines`, gap: { old_start, new_start, count, before, after } });
+  const multi = { ...data, diff: { rows: [
+    gap(1, 1, 10, false, true), ...data.diff.rows.slice(1),
+    gap(20, 21, 30, true, true), ...data.diff.rows.slice(1).map(r => ({ ...r, old_number: r.old_number && 50, new_number: r.new_number && 51 })),
+    gap(60, 61, 15, true, false),
+  ] } };
+  const map = new Map([[meta.path, { data: multi }]]);
+  const rows = buildPage([meta], map, [], null);
+  const controls = rows.filter(r => r.expand);
+  assert.deepEqual(controls.map(r => r.expand), ["up", "down", "up", "down"]);
+  assert.deepEqual(controls.map(r => r.height), [22, 22, 22, 22]);
+  assert.equal(new Set(rows.map(r => r.key)).size, rows.length);
+  for (const row of controls) {
+    assert.equal(hitControl(row, { x: 35, width: 800 }), "expand");
+    assert.equal(hitControl(row, { x: 150, width: 800 }), null, "hunk text is not a button");
+  }
+  assert.equal(buildPage([meta], map, [], null, { collapsed: new Set([meta.path]) }).filter(r => r.expand).length, 0);
+  const draftMeta = { ...meta, status: "draft" };
+  assert.ok(!buildPage([draftMeta], map, [], null).some(r => r.expand), "outdated draft-only context is read-only");
 });
 
 const launcher = (await readFile(new URL("../mods/review-tabs/launcher.js", import.meta.url), "utf8"))

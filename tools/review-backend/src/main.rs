@@ -32,6 +32,7 @@ struct Request {
     snapshot: Option<String>,
     mode: Option<String>,
     context: Option<usize>,
+    reveal: Option<Vec<diff::ContextRange>>,
     fingerprint: Option<String>,
     viewed: Option<bool>,
     side: Option<String>,
@@ -417,11 +418,17 @@ fn handle(req: Request, home: &Path) -> Result<Value> {
             if context > MAX_LINES {
                 return Err(format!("Context cannot exceed {MAX_LINES} lines"));
             }
-            let rendered = diff::render(&s, req.mode.as_deref().unwrap_or("structural"), context)?;
+            let reveal = diff::context_ranges(&s, req.reveal.unwrap_or_default())?;
+            let rendered = diff::render(
+                &s,
+                req.mode.as_deref().unwrap_or("structural"),
+                context,
+                &reveal,
+            )?;
             let add = rendered.rows.iter().filter(|r| r.kind == "new").count();
             let del = rendered.rows.iter().filter(|r| r.kind == "old").count();
             Ok(
-                json!({"snapshot":s.id,"path":s.path,"base":s.base,"stale":repo.stale(&s),"context":context,"add":add,"del":del,"diff":rendered}),
+                json!({"snapshot":s.id,"path":s.path,"base":s.base,"stale":repo.stale(&s),"context":context,"reveal":reveal,"add":add,"del":del,"diff":rendered}),
             )
         }
         "comment" => {

@@ -386,6 +386,181 @@ fn manifest_has_text_stats_and_literal_paths_for_all_uncommitted_files() {
     assert_eq!(modified["fingerprint"].as_str().unwrap().len(), 64);
 }
 
+fn directional_context_expansion(mode: &str) {
+    let f = Fixture::new();
+    let old = (1..=100)
+        .map(|i| format!("fn value_{i}() -> usize {{ {i} }}\n"))
+        .collect::<String>();
+    fs::write(f.repo.path().join("main.rs"), &old).unwrap();
+    f.git(&["commit", "-am", "context base"]);
+    let new = old
+        .replace(
+            "fn value_20() -> usize { 20 }",
+            "fn value_20() -> usize { 999 }\nfn inserted() -> usize { 42 }",
+        )
+        .replace(
+            "fn value_70() -> usize { 70 }",
+            "fn value_70() -> usize { 888 }",
+        );
+    fs::write(f.repo.path().join("main.rs"), &new).unwrap();
+    let mut data = f
+        .run(json!({"action":"open","path":"main.rs","mode":mode}))
+        .unwrap();
+    if mode == "structural" {
+        assert_eq!(data["diff"]["engine"], "Difftastic 0.72.0");
+    }
+    let gaps = |v: &Value| {
+        v["diff"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.get("gap").cloned())
+            .collect::<Vec<_>>()
+    };
+    let numbers = |v: &Value, side: &str| {
+        v["diff"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r[side].as_u64())
+            .collect::<Vec<_>>()
+    };
+    let original = gaps(&data);
+    assert_eq!(original.len(), 3, "{}", data["diff"]);
+    assert_eq!(
+        (
+            original[0]["before"].as_bool(),
+            original[0]["after"].as_bool()
+        ),
+        (Some(false), Some(true))
+    );
+    assert_eq!(
+        (
+            original[1]["before"].as_bool(),
+            original[1]["after"].as_bool()
+        ),
+        (Some(true), Some(true))
+    );
+    assert_eq!(
+        (
+            original[2]["before"].as_bool(),
+            original[2]["after"].as_bool()
+        ),
+        (Some(true), Some(false))
+    );
+    // A line inserted by the first change offsets the next gap's coordinates.
+    assert_eq!(
+        original[1]["new_start"].as_u64().unwrap(),
+        original[1]["old_start"].as_u64().unwrap() + 1
+    );
+    let snapshot = data["snapshot"].clone();
+    let stats = (data["add"].clone(), data["del"].clone());
+    fs::write(
+        f.repo.path().join("main.rs"),
+        "// live edits must not appear\n",
+    )
+    .unwrap();
+    for (gap, up) in [
+        (&original[0], true),
+        (&original[1], false),
+        (&original[1], true),
+        (&original[2], false),
+    ] {
+        let offset = if up {
+            gap["count"].as_u64().unwrap() - 10
+        } else {
+            0
+        };
+        let range = json!({"old_start":gap["old_start"].as_u64().unwrap()+offset,"new_start":gap["new_start"].as_u64().unwrap()+offset,"count":10});
+        let mut reveal = data["reveal"].as_array().unwrap().clone();
+        reveal.push(range);
+        let before = numbers(&data, "new_number").len();
+        data = f
+            .run(json!({"action":"snapshot","snapshot":snapshot,"mode":mode,"reveal":reveal}))
+            .unwrap();
+        assert_eq!(data["snapshot"], snapshot);
+        assert_eq!((data["add"].clone(), data["del"].clone()), stats);
+        assert_eq!(
+            numbers(&data, "new_number").len(),
+            before + 10,
+            "only the requested ten lines appear"
+        );
+        assert_eq!(data["stale"], true);
+        assert!(!data.to_string().contains("live edits must not appear"));
+    }
+    // Meeting expansions join hunks with no duplicate lines or leftover controls.
+    let mut reveal = data["reveal"].as_array().unwrap().clone();
+    for gap in gaps(&data) {
+        reveal.push(
+            json!({"old_start":gap["old_start"],"new_start":gap["new_start"],"count":gap["count"]}),
+        );
+    }
+    data = f
+        .run(json!({"action":"snapshot","snapshot":snapshot,"mode":mode,"reveal":reveal}))
+        .unwrap();
+    assert!(gaps(&data).is_empty());
+    assert_eq!(
+        numbers(&data, "old_number"),
+        (1..=100).collect::<Vec<u64>>()
+    );
+    assert_eq!(
+        numbers(&data, "new_number"),
+        (1..=101).collect::<Vec<u64>>()
+    );
+    assert!(
+        data["reveal"].as_array().unwrap().len() <= 3,
+        "adjacent reveal intervals are merged"
+    );
+    let comment = f.run(json!({"action":"comment","snapshot":snapshot,"side":"new","start":101,"body":"Comment on expanded code"})).unwrap();
+    assert_eq!(
+        comment["comments"][0]["quote"],
+        "fn value_100() -> usize { 100 }"
+    );
+}
+
+#[test]
+fn text_context_expands_each_gap_end_independently() {
+    directional_context_expansion("text");
+}
+
+#[test]
+#[ignore = "requires Difftastic 0.72.0 on PATH"]
+fn structural_context_expands_each_gap_end_independently() {
+    directional_context_expansion("structural");
+}
+
+#[test]
+fn context_ranges_reject_invalid_or_overflowing_coordinates() {
+    let f = Fixture::new();
+    f.edit();
+    let s = f.open();
+    for range in [
+        json!({"old_start":0,"new_start":1,"count":1}),
+        json!({"old_start":1,"new_start":0,"count":1}),
+        json!({"old_start":1,"new_start":1,"count":0}),
+        json!({"old_start":1,"new_start":1,"count":4}),
+        json!({"old_start":usize::MAX,"new_start":1,"count":2}),
+    ] {
+        assert!(f
+            .run(json!({"action":"snapshot","snapshot":s["snapshot"],"reveal":[range]}))
+            .is_err());
+    }
+}
+
+#[test]
+fn file_boundaries_and_newline_annotations_do_not_invent_context_controls() {
+    let f = Fixture::new();
+    fs::write(f.repo.path().join("main.rs"), "one\ntwo\nthree\n").unwrap();
+    f.git(&["commit", "-am", "short base"]);
+    fs::write(f.repo.path().join("main.rs"), "ONE\ntwo\nTHREE").unwrap();
+    let s = f.open();
+    let rows = s["diff"]["rows"].as_array().unwrap();
+    assert!(!rows.iter().any(|r| r.get("gap").is_some()));
+    assert!(rows
+        .iter()
+        .any(|r| r["text"] == "\\ No newline at end of file"));
+}
+
 #[test]
 #[ignore = "requires Difftastic 0.72.0 on PATH"]
 fn real_difftastic_structural_adapter() {

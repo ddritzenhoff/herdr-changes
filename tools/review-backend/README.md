@@ -73,8 +73,13 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
   unrelated to staging or committing. Checkboxes update optimistically per file,
   never pulse/dim the whole page, and roll back that file only if saving fails.
   Pending/deferred manifests preserve these local updates.
-- **Expand context** adds ten surrounding lines, always from the same frozen
-  snapshot. It cannot accidentally pull newer agent edits into an old comment.
+- **Context expansion** uses gutter arrows beside each hidden range. The top
+  arrow reveals earlier lines, the bottom arrow reveals later lines, and stacked
+  down/up arrows between hunks expand from either end. Each click reveals up to
+  ten unchanged lines from that frozen snapshot, without expanding other gaps or
+  jumping to the file header. Meeting hunks join, and arrows disappear at file
+  boundaries. Expanded lines support the usual selection and comments; newer
+  agent edits cannot leak into an old review.
 - File-tree navigation/scrolling preserves open comment text. Save or Cancel
   before opening a different comment, collapsing its file or sending feedback.
 
@@ -168,6 +173,11 @@ herdr-app check ~/.config/herdr-app/mods/review
 herdr-app check ~/.config/herdr-app/mods/review-tabs
 herdr-app status
 ```
+
+Directional-context tests cover both Git text and real Difftastic alignment,
+inserted-line offsets, repeated expansion/hunk joining, file boundaries, immutable
+snapshots and comments on revealed code. UI tests cover arrow hit zones, failure
+recovery and preserving open editors.
 
 Tests use temporary repositories and mocked agent transport. Native integration
 checks exercise stacked cards, scrolling large diffs offscreen/back, inline editor/save, and adjacent-tab

@@ -39,7 +39,7 @@ function harness({ root = "/repo", register = false } = {}) {
   }
   const file = (path, snapshot = `snapshot-${backend.version}-${path}`) => ({
     snapshot, path, context: 3, stale: false, add: 1, del: path === "new.rs" ? 0 : 1,
-    diff: { engine: "Difftastic 0.72.0", notice: null, rows: path === "new.rs" ? [
+    diff: { engine: "Difftastic 0.72.0", notice: null, rows: backend.diffRows && path !== "new.rs" ? backend.diffRows : path === "new.rs" ? [
       { kind: "hunk", text: "@@ -0 +1 @@" },
       { kind: "new", side: "new", number: 1, new_number: 1, old_number: null, text: "new file", spans: [] },
     ] : [
@@ -81,7 +81,10 @@ function harness({ root = "/repo", register = false } = {}) {
         backend.viewed = Object.fromEntries(Object.entries(backend.viewed).filter(([path, token]) => files().some(f => f.path === path && f.fingerprint === token)));
         data = { root: "/repo", base: "HEAD-SHA", files: files(), comments: backend.comments, viewed: backend.viewed };
       } else if (req.action === "open") data = file(req.path);
-      else if (req.action === "snapshot") data = { ...file("src/main.rs", req.snapshot), context: req.context };
+      else if (req.action === "snapshot") {
+        if (backend.failSnapshot) return { code: 1, stdout: JSON.stringify({ ok: false, error: "Expansion failed" }) };
+        data = { ...file("src/main.rs", req.snapshot), context: req.context, reveal: req.reveal };
+      }
       else if (req.action === "comment") {
         const id = req.id || `c${backend.comments.length + 1}`;
         backend.comments = [...backend.comments.filter(c => c.id !== id), { ...req, id, path: req.snapshot.endsWith("new.rs") ? "new.rs" : "src/main.rs", quote: "let n = 2;" }];
@@ -205,11 +208,56 @@ test("Viewed collapses a card and is invalidated when its changes change", async
   assert.equal(h.view.viewed["src/main.rs"], undefined); assert.ok(!h.view.collapsed.has("src/main.rs"));
 });
 
-test("context expands the frozen snapshot rather than recapturing a changing file", async () => {
-  const h = harness(); await h.load();
-  const row = h.view.rows.find(r => r.kind === "hunk"), snapshot = h.view.entries.get(row.path).data.snapshot;
+function contextFixture(h) {
+  const gap = (old_start, new_start, count, before, after) => ({ kind: "hunk", text: `${count} hidden lines`, gap: { old_start, new_start, count, before, after } });
+  const code = (old_number, new_number) => ({ kind: "context", side: "new", number: new_number, old_number, new_number, text: "unchanged", spans: [] });
+  h.backend.diffRows = [gap(1, 1, 16, false, true), code(17, 17), gap(24, 25, 40, true, true), code(64, 65), gap(80, 81, 21, true, false)];
+}
+
+test("gutter arrows expand just their end of the frozen gap and never jump to the file header", async () => {
+  const h = harness(); contextFixture(h); await h.load(); h.render();
+  const snapshot = h.view.entries.get("src/main.rs").data.snapshot;
+  const controls = h.view.rows.filter(r => r.expand), scrolls = h.scrolls.length;
+  for (let i = 0; i < controls.length; i++) {
+    const row = h.view.rows.find(r => r.key === controls[i].key);
+    h.view.press = { x: 35, width: 800 };
+    h.view.activate(row.key, h.cx); await h.flush(); h.render();
+    const request = h.calls.at(-1);
+    assert.equal(request.action, "snapshot"); assert.equal(request.snapshot, snapshot); assert.equal(request.context, 3);
+    assert.deepEqual(request.reveal.at(-1), [
+      { old_start: 7, new_start: 7, count: 10 },
+      { old_start: 24, new_start: 25, count: 10 },
+      { old_start: 54, new_start: 55, count: 10 },
+      { old_start: 80, new_start: 81, count: 10 },
+    ][i]);
+    assert.equal(request.reveal.length, i + 1, "earlier expansions are preserved");
+  }
+  assert.equal(h.scrolls.length, scrolls);
+  assert.equal(h.view.jumpPath, null);
+  assert.ok(h.texts.includes("16 hidden lines"));
+  assert.ok(!h.handlers.has(`expand-${controls[0].key}:click`), "arrows use the list-owned handler");
+});
+
+test("context expansion stops at the file boundary and preserves the page on failure", async () => {
+  const h = harness(); contextFixture(h); h.backend.diffRows[0].gap.count = 4; await h.load();
+  let row = h.view.rows.find(r => r.expand), entry = h.view.entries.get(row.path);
+  h.backend.failSnapshot = true;
+  const data = entry.data;
   h.view.expandContext(row, h.cx); await h.flush();
-  const request = h.calls.at(-1); assert.equal(request.action, "snapshot"); assert.equal(request.snapshot, snapshot); assert.equal(request.context, 13);
+  assert.equal(entry.data, data); assert.match(h.view.error, /Expansion failed/);
+  assert.deepEqual(h.calls.at(-1).reveal, [{ old_start: 1, new_start: 1, count: 4 }]);
+  h.backend.failSnapshot = false;
+  h.view.expandContext(row, h.cx); await h.flush();
+  const calls = h.calls.length;
+  h.view.expandContext({ ...row, snapshot: "obsolete" }, h.cx); await h.flush();
+  assert.equal(h.calls.length, calls, "a queued event from an obsolete snapshot cannot expand a new capture");
+});
+
+test("context arrows cannot move an open comment editor or drop its unsaved text", async () => {
+  const h = harness(); contextFixture(h); await h.load(); h.plus({ number: 17 }); h.type("Unsent comment");
+  const row = h.view.rows.find(r => r.expand), calls = h.calls.length, selection = h.view.selection;
+  h.view.expandContext(row, h.cx); await h.flush();
+  assert.equal(h.calls.length, calls); assert.equal(h.view.selection, selection); assert.equal(h.view.note.value(), "Unsent comment");
 });
 
 test("review page is pinned to the originating agent and does not register a tab using transient init focus", async () => {
