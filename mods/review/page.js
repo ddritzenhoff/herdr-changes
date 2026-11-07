@@ -35,6 +35,20 @@ function fileRows(data, meta, entry, width) {
   return rows;
 }
 
+export const gutter = { number: 60, plusLeft: 52, plusSize: 22 };
+export const anchorLabel = s => `${s.start === s.end ? "line" : "lines"} ${s.side === "old" ? "L" : "R"}${s.start}${s.end === s.start ? "" : `–${s.side === "old" ? "L" : "R"}${s.end}`}`;
+export function commentFrame(width, layout, side) {
+  const split = layout === "split" && width / 2 >= 340;
+  const lane = split ? width / 2 : width;
+  const inset = Math.min(72, Math.floor(lane * 0.18));
+  return { x: (split && side === "new" ? lane : 0) + inset, width: Math.max(1, Math.min(760, lane - inset - 16)) };
+}
+const surroundFor = (layout, row, side) => ({
+  layout,
+  old: layout === "split" && side === "new" ? "empty" : row?.kind === "split" ? row.old?.kind || "empty" : row?.kind || "context",
+  new: layout === "split" && side === "old" ? "empty" : row?.kind === "split" ? row.new?.kind || "empty" : row?.kind || "context",
+});
+
 // Pure flattened page data; no native elements, entities or handlers are cached.
 export function buildPage(files, entries, comments, selection, { width = 840, collapsed = new Set() } = {}) {
   const rows = [], columns = Math.max(12, Math.floor((width - 32) / 7.3));
@@ -42,17 +56,28 @@ export function buildPage(files, entries, comments, selection, { width = 840, co
   const all = [...files, ...[...new Set(comments.map(c => c.path))].filter(p => !paths.has(p)).map(path => ({ path, status: "draft", fingerprint: "" }))];
   // Give action strips their own keys so a single list-owned click callback
   // can hit-test by x only, without guessing a scrolled row's y coordinate.
-  const editor = path => [
-    { kind: "editor", key: "inline-editor", path, selection, height: 170 },
-    { kind: "editor-actions", key: "inline-editor-actions", path, selection, height: 40 },
-  ];
-  const commentRow = (c, outdated) => [
-    { kind: "comment", key: `comment:${c.id}`, path: c.path, comment: c, outdated, height: 32 },
-    { kind: "comment-body", key: `comment-body:${c.id}`, path: c.path, comment: c, outdated,
-      height: Math.min(268, 21 + lines(c.body, columns) * 18 + (outdated ? Math.min(4, lines(c.quote, columns)) * 17 + 24 : 0)) },
-  ];
+  const editor = (path, layout, source) => {
+    const frame = commentFrame(width, layout, selection.side), surround = surroundFor(layout, source, selection.side);
+    return [
+      { kind: "bubble-gap", key: "inline-editor-top", path, surround, height: 12 },
+      { kind: "editor", key: "inline-editor", path, selection, frame, surround, height: 170 },
+      { kind: "editor-actions", key: "inline-editor-actions", path, selection, frame, surround, height: 44 },
+      { kind: "bubble-gap", key: "inline-editor-bottom", path, surround, height: 12 },
+    ];
+  };
+  const commentRow = (c, outdated, layout, source) => {
+    const frame = commentFrame(width, layout, c.side), surround = surroundFor(layout, source, c.side);
+    const textColumns = Math.max(12, Math.floor((frame.width - 24) / 7.3));
+    return [
+      { kind: "bubble-gap", key: `comment-top:${c.id}`, path: c.path, surround, height: 12 },
+      { kind: "comment", key: `comment:${c.id}`, path: c.path, comment: c, outdated, frame, surround, height: 34 },
+      { kind: "comment-body", key: `comment-body:${c.id}`, path: c.path, comment: c, outdated, frame, surround,
+        height: Math.min(300, 60 + lines(c.body, textColumns) * 18 + (outdated ? Math.min(4, lines(c.quote, textColumns)) * 17 + 24 : 0)) },
+      { kind: "bubble-gap", key: `comment-bottom:${c.id}`, path: c.path, surround, height: 12 },
+    ];
+  };
   for (const meta of all) {
-    const path = meta.path, entry = entries.get(path), data = entry?.data;
+    const path = meta.path, entry = entries.get(path), data = entry?.data, layout = layoutFor(meta.status);
     rows.push({ kind: "file", key: `file:${path}`, path, meta, entry, height: 43 });
     if (!collapsed.has(path)) {
       const matching = comments.filter(c => c.path === path);
@@ -64,10 +89,10 @@ export function buildPage(files, entries, comments, selection, { width = 840, co
           if (!isCode(row)) continue;
           for (const c of matching) {
             if (c.snapshot !== data.snapshot || numberOn(row, c.side) !== c.end || placed.has(c.id)) continue;
-            rows.push(...commentRow(c, Boolean(data.stale || entry.changed))); placed.add(c.id);
-            if (selection?.commentId === c.id) rows.push(...editor(path));
+            rows.push(...commentRow(c, Boolean(data.stale || entry.changed), layout, row)); placed.add(c.id);
+            if (selection?.commentId === c.id) rows.push(...editor(path, layout, row));
           }
-          if (selection && !selection.commentId && selection.path === path && selection.snapshot === data.snapshot && numberOn(row, selection.side) === selection.end) rows.push(...editor(path));
+          if (selection && !selection.commentId && selection.path === path && selection.snapshot === data.snapshot && numberOn(row, selection.side) === selection.end) rows.push(...editor(path, layout, row));
         }
         if (!source.length) rows.push({ kind: "message", key: `empty:${path}`, path, text: "No text hunks (empty file or metadata-only change).", height: 55 });
         if (data.diff.notice) rows.push({ kind: "notice", key: `notice:${path}`, path, text: data.diff.notice, height: Math.min(100, 16 + lines(data.diff.notice, columns) * 16) });
@@ -75,8 +100,8 @@ export function buildPage(files, entries, comments, selection, { width = 840, co
         rows.push({ kind: "message", key: `load:${path}`, path, text: entry?.error || "Loading diff…", load: !entry?.error, retry: Boolean(entry?.error), height: entry?.error ? Math.min(180, 64 + lines(entry.error, columns) * 16) : 60 });
       }
       for (const c of matching.filter(c => !placed.has(c.id))) {
-        rows.push(...commentRow(c, Boolean(data || meta.status === "draft")));
-        if (selection?.commentId === c.id) rows.push(...editor(path));
+        rows.push(...commentRow(c, Boolean(data || meta.status === "draft"), layout));
+        if (selection?.commentId === c.id) rows.push(...editor(path, layout));
       }
       rows.push({ kind: "end", key: `end:${path}`, path, height: 7 });
     }
@@ -114,7 +139,9 @@ export function fileTree(files, folded = new Set()) {
 export const controlWidths = { collapse: 28, viewed: 92, expand: 123, edit: 48, delete: 56, cancel: 68, save: 110, retry: 88 };
 export function hitControl(row, press) {
   if (!press || !Number.isFinite(press.x) || !Number.isFinite(press.width) || press.width <= 0) return null;
-  const x = press.x, end = press.width - (row.kind === "editor-actions" ? 14 : 12);
+  const x = press.x - (row.frame?.x || 0), width = row.frame?.width ?? press.width;
+  if (x < 0 || x > width) return null;
+  const end = width - (row.kind === "editor-actions" ? 14 : 12);
   const right = (action, offset = 0) => x >= end - offset - controlWidths[action] && x <= end - offset;
   if (row.kind === "file") {
     if (x >= 12 && x <= 12 + controlWidths.collapse) return "collapse";
@@ -133,12 +160,16 @@ export function hitControl(row, press) {
   return null;
 }
 
-export function hitLine(item, press) {
-  if (!press || !isCode(item) || !Number.isFinite(press.x) || !Number.isFinite(press.width) || press.width <= 0) return null;
+export function hitCode(item, press) {
+  if (!press || !isCode(item) || !Number.isFinite(press.x) || !Number.isFinite(press.width) || press.width <= 0 || press.x < 0 || press.x > press.width) return null;
   const split = item.kind === "split", half = press.width / 2;
   const side = split ? press.x < half ? "old" : "new" : item.side;
   const localX = split && side === "new" ? press.x - half : press.x;
   const source = split ? item[side] : item;
-  if (!source || !source.number || localX < 0 || localX > 23) return null;
-  return { side, number: source.number };
+  if (!source?.number) return null;
+  return { side, number: source.number, plus: localX >= gutter.plusLeft && localX <= gutter.plusLeft + gutter.plusSize };
+}
+export function hitLine(item, press) {
+  const hit = hitCode(item, press);
+  return hit?.plus ? { side: hit.side, number: hit.number } : null;
 }

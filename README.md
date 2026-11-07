@@ -14,9 +14,12 @@ beside the code, then send one feedback batch to your coding agent.
 - Modified files use **split** diffs; new/deleted files use a single column.
   [Difftastic](https://github.com/Wilfred/difftastic) supplies structural alignment
   and changed-token highlights, with a Git text fallback.
-- Hover a line's blue **+** to comment inline. Shift-click another **+** to select
-  a range. Saved drafts can be edited/deleted and survive restarts.
-- Viewed checkboxes track progress; context expansion shows more surrounding code.
+- Click a line or line number for a persistent blue outline. Hovering another
+  line independently reveals its blue **+**. Click + to open an inset comment
+  card. Shift-click lines or **+** for a range. Saved drafts can be edited/deleted
+  and survive restarts.
+- Viewed checkboxes track progress with immediate per-file updates, without
+  flickering other controls; context expansion shows more surrounding code.
 - Changes arriving while you type never move your comment anchors. Outdated
   drafts retain their original quotes and snapshots.
 - **Review & send** previews the exact message before pasting/submitting it to

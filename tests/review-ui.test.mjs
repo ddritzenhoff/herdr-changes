@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { buildPage, fileTree, hitLine, hitControl, isCode, controlWidths } from "../mods/review/page.js";
+import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "../mods/review/page.js";
 import { desktopColors } from "../mods/review/desktop.js";
 import { errorText } from "../mods/review/model.js";
 import { submitToIdleAgent } from "../mods/review/delivery.js";
@@ -11,14 +11,15 @@ const source = (await readFile(new URL("../mods/review/main.js", import.meta.url
   .replace(/^import .*;\n/gm, "")
   .replace("export default class Review", "globalThis.RootReview = class Review");
 function harness({ root = "/repo", register = false } = {}) {
-  const calls = [], sends = [], texts = [], handlers = new Map(), ids = [], notifications = [], moves = [], registry = {}, lists = [], scrolls = [];
-  const backend = { comments: [], viewed: {}, failSend: false, failArchive: false, status: "idle", dark: true, active: true, version: 1, extraFiles: [] };
+  const calls = [], sends = [], texts = [], handlers = new Map(), ids = [], notifications = [], moves = [], registry = {}, lists = [], scrolls = [], styles = new Map();
+  const backend = { comments: [], viewed: {}, failSend: false, failArchive: false, status: "idle", dark: true, active: true, version: 1, extraFiles: [], failViewed: false, pauseViewed: false, viewedWaiters: [] };
   let deferred = false;
   function builder() {
     let id;
     const proxy = new Proxy({}, { get: (_, name) => (...args) => {
       if (deferred && String(name).startsWith("on_")) assert.fail("Handlers must not be registered in deferred code rows");
-      if (name === "id") { id = args[0]; ids.push(id); }
+      if (name === "id") { id = args[0]; ids.push(id); styles.set(id, {}); }
+      if (id && ["opacity", "bg", "border_color", "disabled"].includes(name)) styles.get(id)[name] = args[0];
       if (id && name === "on_click") handlers.set(`${id}:click`, args[0]);
       if (id && name === "on_mouse_down") handlers.set(`${id}:down`, args[1]);
       if (id && name === "on_size_change") handlers.set(`${id}:size`, args[0]);
@@ -86,7 +87,12 @@ function harness({ root = "/repo", register = false } = {}) {
         backend.comments = [...backend.comments.filter(c => c.id !== id), { ...req, id, path: req.snapshot.endsWith("new.rs") ? "new.rs" : "src/main.rs", quote: "let n = 2;" }];
         data = { comments: backend.comments };
       } else if (req.action === "delete") { backend.comments = backend.comments.filter(c => c.id !== req.id); data = { comments: backend.comments }; }
-      else if (req.action === "viewed") { if (req.viewed) backend.viewed[req.path] = req.fingerprint; else delete backend.viewed[req.path]; data = { viewed: backend.viewed }; }
+      else if (req.action === "viewed") {
+        if (backend.pauseViewed) await new Promise(resolve => backend.viewedWaiters.push(resolve));
+        if (backend.failViewed) return { code: 1, stdout: JSON.stringify({ ok: false, error: "Viewed could not be saved" }) };
+        if (req.viewed) backend.viewed[req.path] = req.fingerprint; else delete backend.viewed[req.path];
+        data = { viewed: backend.viewed };
+      }
       else if (req.action === "prepare") data = { review_id: "batch", count: backend.comments.length, text: "Exact review message", stale_count: 1 };
       else if (req.action === "sent") {
         if (backend.failArchive) return { code: 1, stdout: JSON.stringify({ ok: false, error: "disk full" }) };
@@ -95,7 +101,7 @@ function harness({ root = "/repo", register = false } = {}) {
       return { code: 0, stdout: JSON.stringify({ ok: true, data }) };
     },
     hc: async args => { sends.push(args); return backend.failSend ? { code: 1, stderr: "agent became busy" } : { code: 0 }; },
-    buildPage, fileTree, hitLine, hitControl, isCode, controlWidths, desktopColors, errorText, submitToIdleAgent,
+    buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel, desktopColors, errorText, submitToIdleAgent,
   };
   vm.runInNewContext(source, sandbox);
   const cx = {
@@ -104,12 +110,12 @@ function harness({ root = "/repo", register = false } = {}) {
     new() { assert.fail("Virtual rows must not mount retained JS entities; scrolling unmounts/releases them"); },
   };
   const wrapper = new sandbox.RootReview(); wrapper.init(p, cx);
-  const view = wrapper;
+  const view = wrapper; view.width = 800;
   async function flush() {
     for (let n = 0; n < 500; n++) {
       await Promise.resolve();
-      if (!view.busy && !view.scanning && !view.pumping) {
-        await Promise.resolve(); if (!view.busy && !view.pumping) return;
+      if (!view.busy && !view.scanning && !view.pumping && !view.viewedPending.size) {
+        await Promise.resolve(); if (!view.busy && !view.pumping && !view.viewedPending.size) return;
       }
     }
     assert.fail("UI requests did not settle");
@@ -119,7 +125,7 @@ function harness({ root = "/repo", register = false } = {}) {
   function plus({ path = "src/main.rs", side = "new", number = 2, shift = false } = {}) {
     const row = view.rows.find(r => r.path === path && (r.kind === "split" ? r[side]?.number : r.number) === number);
     assert.ok(row, "code line exists");
-    view.press = { width: 800, x: row.kind === "split" && side === "new" ? 410 : 10, shift };
+    view.press = { width: 800, x: (row.kind === "split" && side === "new" ? 400 : 0) + gutter.plusLeft + gutter.plusSize / 2, shift };
     view.select(row.key, cx);
   }
   function type(text) { view.note.set_value(text); view.note.events.change({}, cx); }
@@ -133,13 +139,13 @@ function harness({ root = "/repo", register = false } = {}) {
       else { action = id.startsWith("edit-") ? "edit" : "delete"; row = view.rows.find(r => r.kind === "comment" && `${action}-${r.comment.id}` === id); }
       assert.ok(row);
       const offset = action === "edit" ? controlWidths.delete + 6 : action === "cancel" ? controlWidths.save + 8 : 0;
-      view.press = { width: 800, x: 800 - (row.kind === "editor-actions" ? 14 : 12) - offset - controlWidths[action] / 2 };
+      view.press = { width: 800, x: row.frame.x + row.frame.width - (row.kind === "editor-actions" ? 14 : 12) - offset - controlWidths[action] / 2 };
       assert.equal(hitControl(row, view.press), action);
       lists.at(-1).click(row.key, cx);
     }
     await flush();
   }
-  return { view, cx, wrapper, flush, render, load, plus, type, comment, click, backend, calls, sends, texts, handlers, ids, notifications, moves, registry, lists, scrolls };
+  return { view, cx, wrapper, flush, render, load, plus, type, comment, click, backend, calls, sends, texts, handlers, ids, notifications, moves, registry, lists, scrolls, styles };
 }
 
 test("stacked review cards load lazily and do not contain the old toolbar or sidebar composer", async () => {
@@ -307,4 +313,111 @@ test("tree navigation tracks a pending file load but stops pinning after user sc
   h.handlers.get("review-hitbox:scroll")({}, h.cx); await h.flush();
   assert.equal(h.view.jumpPath, null); assert.equal(h.scrolls.length, before);
   h.view.pick("new.rs", h.cx); assert.equal(h.view.jumpPath, null, "already-loaded cards jump only once");
+});
+
+test("Viewed updates optimistically without dimming other boxes or repainting on acknowledgement", async () => {
+  const h = harness(); await h.load(); h.render();
+  const opacity = h.styles.get("viewed-new.rs").opacity ?? 1;
+  h.backend.pauseViewed = true;
+  h.view.toggleViewed("src/main.rs", h.cx); h.render();
+  assert.equal(h.view.busy, false);
+  assert.equal(h.view.viewed["src/main.rs"], "v1");
+  assert.ok(h.view.collapsed.has("src/main.rs"));
+  assert.equal(h.styles.get("viewed-new.rs").opacity ?? 1, opacity);
+  for (let i = 0; i < 20 && !h.backend.viewedWaiters.length; i++) await Promise.resolve();
+  assert.equal(h.backend.viewedWaiters.length, 1);
+  const notifications = h.notifications.length;
+  h.backend.viewedWaiters.shift()(); await h.flush();
+  assert.equal(h.notifications.length, notifications, "acknowledgement has no second visual transition");
+});
+
+test("independent Viewed acknowledgements and stale scans preserve other optimistic checkboxes", async () => {
+  const h = harness(); await h.load(); await h.load("new.rs");
+  h.backend.pauseViewed = true;
+  h.view.toggleViewed("src/main.rs", h.cx); h.view.toggleViewed("new.rs", h.cx);
+  const oldManifest = { root: h.view.root, base: h.view.base, files: h.view.files, comments: [], viewed: {} };
+  h.view.applyManifest(oldManifest, h.view.revision, h.cx);
+  assert.equal(h.view.viewed["src/main.rs"], "v1"); assert.equal(h.view.viewed["new.rs"], "new-v1");
+  for (let i = 0; i < 20 && !h.backend.viewedWaiters.length; i++) await Promise.resolve();
+  h.backend.viewedWaiters.shift()();
+  for (let i = 0; i < 40 && !h.backend.viewedWaiters.length; i++) await Promise.resolve();
+  assert.equal(h.view.viewed["new.rs"], "new-v1", "first ack cannot clear the second checkbox");
+  assert.equal(h.backend.viewedWaiters.length, 1);
+  h.backend.viewedWaiters.shift()(); await h.flush();
+  assert.equal(Object.keys(h.view.viewed).length, 2);
+});
+
+test("a failed Viewed update restores just that file's previous flag and collapsed state", async () => {
+  const h = harness(); await h.load(); await h.load("new.rs");
+  h.view.toggleViewed("new.rs", h.cx); await h.flush();
+  h.backend.failViewed = true;
+  h.view.toggleViewed("src/main.rs", h.cx);
+  assert.equal(h.view.viewed["src/main.rs"], "v1"); await h.flush();
+  assert.equal(h.view.viewed["src/main.rs"], undefined); assert.ok(!h.view.collapsed.has("src/main.rs"));
+  assert.equal(h.view.viewed["new.rs"], "new-v1"); assert.ok(h.view.collapsed.has("new.rs"));
+  assert.match(h.view.error, /could not be saved/);
+});
+
+test("clicking a line outlines it without opening a comment; hover is a separate native layer", async () => {
+  const h = harness(); await h.load(); h.render();
+  const line = h.view.rows.find(r => r.kind === "split" && r.new?.number === 2);
+  h.view.press = { x: 600, width: 800 }; h.view.activate(line.key, h.cx); h.render();
+  assert.equal(h.view.highlight.start, 2); assert.equal(h.view.highlight.side, "new");
+  assert.equal(h.view.selection, undefined);
+  assert.ok(!h.view.rows.some(r => r.kind === "editor"));
+  assert.equal(h.styles.get(`line-hover:${line.key}:new`).opacity, 1, "selected line keeps its + visible");
+  const other = h.view.rows.find(r => r.kind === "split" && r.new?.number === 3);
+  assert.equal(h.styles.get(`line-hover:${other.key}:new`).opacity, 0, "other badges are independently revealed by native hover");
+  assert.ok(!h.handlers.has(`line-hover:${other.key}:new:click`));
+});
+
+test("line highlighting never moves an open comment's anchor or loses typed text", async () => {
+  const h = harness(); await h.load(); h.plus(); h.type("Still about line two");
+  const anchor = h.view.selection;
+  const other = h.view.rows.find(r => r.kind === "split" && r.new?.number === 3);
+  h.view.press = { x: 600, width: 800 }; h.view.activate(other.key, h.cx); h.render();
+  assert.equal(h.view.highlight.start, 3);
+  assert.equal(h.view.selection, anchor); assert.equal(h.view.selection.start, 2);
+  assert.equal(h.view.note.value(), "Still about line two");
+  assert.ok(h.texts.includes("Add a comment on line R2"));
+  await h.click("comment-save");
+  assert.equal(h.view.comments[0].start, 2);
+});
+
+test("Shift-clicked line ranges can become comments via + without reselecting anchors", async () => {
+  const h = harness(); await h.load();
+  for (const number of [1, 3]) {
+    const row = h.view.rows.find(r => r.kind === "split" && r.new?.number === number);
+    h.view.press = { x: 600, width: 800, shift: number === 3 }; h.view.activate(row.key, h.cx);
+  }
+  assert.equal(h.view.highlight.start, 1); assert.equal(h.view.highlight.end, 3);
+  assert.equal(h.view.selection, undefined);
+  h.plus({ number: 2 });
+  assert.equal(h.view.selection.start, 1); assert.equal(h.view.selection.end, 3);
+  h.render(); assert.ok(h.texts.includes("Add a comment on lines R1–R3"));
+});
+
+test("Viewed uses a real painted checkmark and does not fade during global operations", async () => {
+  const h = harness(); await h.load(); h.render();
+  const t = desktopColors(true);
+  assert.equal(h.styles.get("viewed-check:src/main.rs").bg, t.input);
+  h.view.toggleViewed("src/main.rs", h.cx); await h.flush(); h.render();
+  assert.equal(h.styles.get("viewed-check:src/main.rs").bg, t.accent);
+  assert.equal(h.styles.get("viewed-src/main.rs").bg, t.viewedBg);
+  h.view.busy = true; h.render();
+  assert.equal(h.styles.get("viewed-new.rs").opacity ?? 1, 1);
+  assert.equal(h.styles.get("viewed-new.rs").disabled, true, "disabled is semantic, not a page-wide opacity pulse");
+  assert.ok(!h.texts.some(text => text.includes("☑") || text.includes("☐")));
+  h.view.busy = false;
+});
+
+test("deferred manifests cannot undo an acknowledged Viewed change made while editing another file", async () => {
+  const h = harness(); await h.load(); await h.load("new.rs"); h.plus(); h.type("Still editing");
+  h.view.scan(h.cx, true); await h.flush();
+  assert.ok(h.view.pendingManifest);
+  h.view.toggleViewed("new.rs", h.cx); await h.flush();
+  assert.equal(h.view.pendingManifest.data.viewed["new.rs"], "new-v1");
+  h.view.cancelComment(h.cx); await h.flush();
+  assert.equal(h.view.viewed["new.rs"], "new-v1");
+  assert.ok(h.view.collapsed.has("new.rs"));
 });

@@ -4,11 +4,13 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, TextareaState, Textarea, EditorState, Editor, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
 import { appHome, exec, focused, spaces, agents, terminals, props, shared, settings, nextCommand, window, hc } from "herdr";
 import { errorText } from "./model.js";
-import { buildPage, fileTree, hitLine, hitControl, isCode, controlWidths } from "./page.js";
+import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "./page.js";
 import { desktopColors } from "./desktop.js";
 import { submitToIdleAgent } from "./delivery.js";
 
 const icon = (name, size = 16) => svg(`mods/review/icons/${name}.svg`).size(size).flex_none();
+const lineBackground = (kind, t) => kind === "old" ? t.diffDel : kind === "new" ? t.diffAdd : kind === "empty" ? t.empty : t.background;
+const gutterBackground = (kind, t) => kind === "old" ? t.gutterDel : kind === "new" ? t.gutterAdd : lineBackground(kind, t);
 function button(id, text, action, enabled = true, primary = false) {
   const t = desktopColors(settings().dark !== false);
   const el = div().id(id).h(28).px(10).flex_none().flex().items_center().justify_center().rounded(5).text_size(12)
@@ -34,7 +36,7 @@ export default class Review extends View {
     this.files = []; this.comments = []; this.viewed = {}; this.entries = new Map(); this.rows = [];
     this.collapsed = new Set(); this.folded = new Set(); this.queue = []; this.deferred = new Map();
     this.busy = false; this.pumping = false; this.scanning = false; this.revision = 0; this.rpc = Promise.resolve();
-    this.visiblePaths = [];
+    this.visiblePaths = []; this.viewedPending = new Map();
     // The deferred renderer only records demand. A data scheduler drains it
     // outside layout, at most three files ahead, with no idle redraws.
     cx.timer.every(120, cx => this.loadVisible(cx));
@@ -111,13 +113,19 @@ export default class Review extends View {
   }
   applyManifest(data, revision, cx) {
     const comments = revision === this.revision ? data.comments : this.comments;
-    const signature = JSON.stringify([data.root, data.base, data.files, comments, data.viewed || {}]);
+    const viewed = { ...(data.viewed || {}) };
+    // An older in-flight scan must not undo optimistic checkbox changes.
+    for (const [path, pending] of this.viewedPending) {
+      if (pending.checked && data.files.some(f => f.path === path && f.fingerprint === pending.fingerprint)) viewed[path] = pending.fingerprint;
+      else delete viewed[path];
+    }
+    const signature = JSON.stringify([data.root, data.base, data.files, comments, viewed]);
     if (signature === this.manifestSignature) return false;
     this.manifestSignature = signature;
     this.root = data.root; this.cwd = data.root; this.base = data.base;
     this.files = data.files; this.comments = comments;
     const previous = this.viewed;
-    this.viewed = data.viewed || {};
+    this.viewed = viewed;
     for (const meta of this.files) {
       const entry = this.entries.get(meta.path) || { context: 3 };
       if (entry.fingerprint && entry.fingerprint !== meta.fingerprint) {
@@ -144,6 +152,7 @@ export default class Review extends View {
         if (this.closed) return;
         if (this.selection || this.preview) {
           this.pendingManifest = { data, revision };
+          for (const path of this.viewedPending.keys()) this.syncPendingViewed(path);
           const changed = Boolean(this.selection && data.files.find(f => f.path === this.selection.path)?.fingerprint !== this.entries.get(this.selection.path)?.meta?.fingerprint);
           if (changed !== this.changedWhileEditing) { this.changedWhileEditing = changed; redraw = true; }
         } else if (this.applyManifest(data, revision, cx)) { this.error = null; this.pump(cx); redraw = true; }
@@ -213,22 +222,49 @@ export default class Review extends View {
     this.collapsed.has(path) ? this.collapsed.delete(path) : this.collapsed.add(path);
     this.rebuild(cx); this.enqueue(path, cx); this.notify(cx);
   }
+  syncPendingViewed(path) {
+    const data = this.pendingManifest?.data;
+    if (!data) return;
+    data.viewed = { ...(data.viewed || {}) };
+    const token = this.viewed[path];
+    if (token && data.files.some(f => f.path === path && f.fingerprint === token)) data.viewed[path] = token;
+    else delete data.viewed[path];
+  }
   toggleViewed(path, cx) {
     if (this.selection?.path === path) { this.error = "Save or cancel the open comment first."; this.notify(cx); return; }
     const entry = this.entries.get(path), checked = !this.viewed[path];
-    if (!entry?.meta) return;
-    this.operation(cx, async cx => {
-      const result = await this.call("viewed", { path, fingerprint: entry.meta.fingerprint, viewed: checked });
-      this.viewed = result.viewed;
-      checked ? this.collapsed.add(path) : this.collapsed.delete(path);
-      this.rebuild(cx); this.enqueue(path, cx);
+    if (!entry?.meta || this.busy || this.viewedPending.has(path)) return;
+    const fingerprint = entry.meta.fingerprint, previous = this.viewed[path], wasCollapsed = this.collapsed.has(path);
+    this.viewedPending.set(path, { checked, fingerprint });
+    if (checked) this.viewed[path] = fingerprint; else delete this.viewed[path];
+    checked ? this.collapsed.add(path) : this.collapsed.delete(path);
+    this.syncPendingViewed(path);
+    this.error = null; this.rebuild(cx); this.notify(cx);
+    // Viewed is independent per file, not a global operation that dims every
+    // control. Acknowledgement has no visual state change or second redraw.
+    cx.spawn(async cx => {
+      try { await this.call("viewed", { path, fingerprint, viewed: checked }); }
+      catch (e) {
+        if (this.closed) return;
+        const unchanged = this.entries.get(path)?.meta?.fingerprint === fingerprint;
+        if (unchanged && previous) this.viewed[path] = previous; else delete this.viewed[path];
+        this.syncPendingViewed(path);
+        if (unchanged && this.selection?.path !== path && this.collapsed.has(path) === checked) {
+          wasCollapsed ? this.collapsed.add(path) : this.collapsed.delete(path);
+        }
+        this.error = errorText(e); this.rebuild(cx); this.notify(cx);
+      } finally { this.viewedPending.delete(path); }
     });
+    this.enqueue(path, cx);
   }
   activate(key, cx) {
     if (this.busy) return;
     const row = this.byKey.get(key);
     if (!row) return; // An event queued before a background replacement.
-    if (isCode(row)) { this.select(key, cx); return; }
+    if (isCode(row)) {
+      !row.readOnly && hitLine(row, this.press) ? this.select(key, cx) : this.highlightLine(row, cx);
+      return;
+    }
     switch (hitControl(row, this.press)) {
       case "collapse": this.toggleCollapse(row.path, cx); break;
       case "viewed": this.toggleViewed(row.path, cx); break;
@@ -240,20 +276,35 @@ export default class Review extends View {
       case "retry": this.entries.get(row.path).error = null; this.enqueue(row.path, cx, true); this.rebuild(cx); this.notify(cx); break;
     }
   }
+  highlightLine(row, cx) {
+    const hit = hitCode(row, this.press);
+    if (!hit) return;
+    const current = this.highlight;
+    const extend = this.press.shift && current?.path === row.path && current.snapshot === row.snapshot && current.side === hit.side;
+    if (this.press.shift && current && !extend) { this.error = "A range must stay on the same file, snapshot and side."; this.notify(cx); return; }
+    const anchor = extend ? current.anchor : hit.number, start = Math.min(anchor, hit.number), end = Math.max(anchor, hit.number);
+    if (end - start >= 50) { this.error = "Select at most 50 lines."; this.notify(cx); return; }
+    this.highlight = { path: row.path, snapshot: row.snapshot, side: hit.side, start, end, anchor };
+    // This is only a visual line selection. Never relocate an open draft.
+    this.jumpPath = null; this.error = null; this.notify(cx);
+  }
   select(key, cx) {
     if (this.busy) return;
     const item = this.byKey.get(key), hit = item && hitLine(item, this.press);
     if (!hit || item.readOnly) return;
-    const current = this.selection;
-    if (current && !this.press.shift) {
-      if (this.note.value().trim()) { this.error = "Save or cancel your current comment first. Shift-click + to extend its range."; this.notify(cx); return; }
+    const current = this.selection || this.highlight;
+    if (this.selection && !this.press.shift && this.note.value().trim()) {
+      this.error = "Save or cancel your current comment first. Shift-click + to extend its range."; this.notify(cx); return;
     }
     const extend = this.press.shift && current && !current.commentId && current.path === item.path && current.snapshot === item.snapshot && current.side === hit.side;
     if (this.press.shift && current && !extend) { this.error = "A range must stay on the same file, snapshot and side."; this.notify(cx); return; }
-    const anchor = extend ? current.anchor : hit.number;
-    const start = Math.min(anchor, hit.number), end = Math.max(anchor, hit.number);
+    const h = this.highlight;
+    const selectedRange = !extend && h?.path === item.path && h.snapshot === item.snapshot && h.side === hit.side && hit.number >= h.start && hit.number <= h.end;
+    const anchor = extend ? current.anchor : selectedRange ? h.anchor : hit.number;
+    const start = selectedRange ? h.start : Math.min(anchor, hit.number), end = selectedRange ? h.end : Math.max(anchor, hit.number);
     if (end - start >= 50) { this.error = "A comment can cover at most 50 lines."; this.notify(cx); return; }
     this.selection = { path: item.path, snapshot: item.snapshot, side: hit.side, start, end, anchor };
+    this.highlight = { ...this.selection };
     this.jumpPath = null; this.error = null; this.rebuild(cx); this.scrollTo("inline-editor"); this.note.focus(); this.notify(cx);
   }
   cancelComment(cx) {
@@ -278,6 +329,7 @@ export default class Review extends View {
     const c = this.comments.find(c => c.id === id);
     if (!c) return;
     this.selection = { ...c, commentId: c.id, anchor: c.start };
+    this.highlight = { path: c.path, snapshot: c.snapshot, side: c.side, start: c.start, end: c.end, anchor: c.start };
     this.note.set_value(c.body); this.jumpPath = null; this.collapsed.delete(c.path);
     this.rebuild(cx); this.scrollTo("inline-editor"); this.note.focus(); this.notify(cx);
   }
@@ -331,46 +383,67 @@ export default class Review extends View {
         .when(s.changed, el => el.bg(kind === "old" ? t.tokenDel : t.tokenAdd)).child(s.text)));
   }
   codeCell(source, side, row, t) {
-    const s = this.selection;
+    const s = this.highlight;
     const selected = source && s && s.path === row.path && s.snapshot === row.snapshot && s.side === side && source.number >= s.start && source.number <= s.end;
-    const bg = selected ? t.selection : source?.kind === "old" ? t.diffDel : source?.kind === "new" ? t.diffAdd : source ? t.background : t.empty;
-    return v_flex().flex_1().min_w(0).h_full().bg(bg).text_color("#00000000")
-      // Only the plus icon inherits this color; code and line numbers have
-      // explicit colors. Native hover reveals + anywhere on this code line.
-      .when(!row.readOnly, el => el.hover(s => s.text_color(t.accent)))
+    return v_flex().flex_1().min_w(0).h_full().relative().bg(lineBackground(source?.kind || "empty", t))
       .when(side === "old" && row.kind === "split", el => el.border_r(1).border_color(t.border))
       .children((source?.wrapped || []).map((parts, index) => h_flex().h(22).flex_none().w_full().items_center().gap(4).pr(6)
-        .child(div().w(23).h(22).flex_none().flex().items_center().justify_center().cursor_pointer()
-          .when(index === 0 && !row.readOnly, el => el.child(icon("add-comment", 18))))
-        .child(div().w(33).h(22).flex_none().pr(4).text_right().text_color(selected ? "#ffffff" : t.dim)
-          .when(selected, el => el.bg(t.accent)).child(index === 0 ? String(source.number) : ""))
+        .child(div().w(gutter.number).h(22).flex_none().pr(8).text_right().bg(gutterBackground(source.kind, t)).text_color(selected || source.kind === "old" || source.kind === "new" ? t.foreground : t.dim).child(index === 0 ? String(source.number) : ""))
         .child(div().w(9).flex_none().text_color(source.kind === "old" ? t.ansi1 : t.ansi2).child(index ? " " : source.kind === "old" ? "−" : source.kind === "new" ? "+" : " "))
-        .child(this.fragments(parts, source.kind, t))));
+        .child(this.fragments(parts, source.kind, t))))
+      // A native hover layer contains only the badge/outline, not the code.
+      // Opacity therefore never dims syntax, and hovering another line does
+      // not touch the persistent clicked-line selection or run JavaScript.
+      .when(Boolean(source) && (!row.readOnly || Boolean(selected)), el => el.child(div().id(`line-hover:${row.key}:${side}`).absolute().inset_0().opacity(selected ? 1 : 0).hover(s => s.opacity(1))
+        .when(Boolean(selected), el => el.child(div().absolute().left(gutter.plusLeft + gutter.plusSize - 1).right(0).top(0).bottom(0).border(2).border_color(t.accent)))
+        .when(!row.readOnly, el => el.child(div().absolute().left(gutter.plusLeft).top(0).size(gutter.plusSize).rounded(5).bg(t.accent).text_color("#ffffff").flex().items_center().justify_center().cursor_pointer().child(icon("add-comment", 16))))));
   }
   codeRow(row, t) {
     const box = h_flex().h(row.height).w_full().border_x(1).border_color(t.border).font_family(settings().font_family || "JetBrains Mono").text_size(12);
     return row.kind === "split" ? box.child(this.codeCell(row.old, "old", row, t)).child(this.codeCell(row.new, "new", row, t))
       : box.child(this.codeCell(row, row.side, row, t));
   }
+  bubbleRow(row, t, content) {
+    const surround = row.surround;
+    const sides = surround.layout === "split" ? ["old", "new"] : ["new"];
+    const box = div().h(row.height).w_full().relative().border_x(1).border_color(t.border)
+      .child(h_flex().absolute().inset_0().children(sides.map(side => div().flex_1().h_full().bg(lineBackground(surround[side], t))
+        .when(side === "old" && surround.layout === "split", el => el.border_r(1).border_color(t.border))
+        .child(div().w(gutter.number).h_full().bg(gutterBackground(surround[side], t))))));
+    if (content) box.child(div().absolute().left(row.frame.x).top(0).w(row.frame.width).h(row.height).child(content));
+    return box;
+  }
   editorRow(row, t) {
     const s = row.selection;
-    return v_flex().id("inline-comment-editor").h(row.height).px(14).py(10).gap(8).bg(t.comment).border(1).border_b(0).border_color(t.accent)
-      .child(h_flex().gap(8).items_center()
-        .child(icon("comment").text_color(t.ansi4))
-        .child(div().font_semibold().child(`${s.commentId ? "Edit comment" : "Comment"} · ${s.side} lines ${s.start}–${s.end}`))
-        .when(this.changedWhileEditing, el => el.child(div().text_size(10).text_color(t.blocked).child("File changed · original snapshot retained"))))
-      .child(div().flex_1().min_h(0).px(10).py(7).bg(t.input).rounded(5).border_1().border_color(t.controlBorder)
-        .child(Textarea.new(this.note).size_full().text_size(13)));
+    return this.bubbleRow(row, t, v_flex().id("inline-comment-editor").h(row.height).px(12).py(12).gap(10).rounded_t(7).bg(t.comment).border(1).border_b(0).border_color(t.commentBorder)
+      .child(h_flex().gap(8).items_center().flex_none()
+        .child(icon("comment", 18).text_color(t.muted))
+        .child(div().min_w(0).truncate().text_size(14).font_semibold().child(`${s.commentId ? "Edit comment" : "Add a comment"} on ${anchorLabel(s)}`)))
+      .when(this.changedWhileEditing, el => el.child(div().flex_none().text_size(10).text_color(t.blocked).child("File changed · original snapshot retained")))
+      .child(div().flex_1().min_h(0).px(10).py(7).bg(t.input).rounded(6).border_1().border_color(t.controlBorder)
+        .child(Textarea.new(this.note).size_full().text_size(13))));
+  }
+  viewedControl(path, t) {
+    const checked = Boolean(this.viewed[path]);
+    return h_flex().id(`viewed-${path}`).w(controlWidths.viewed).h(28).px(9).gap(7).flex_none().items_center().justify_center().rounded(6)
+      .bg(checked ? t.viewedBg : t.background).border(1).border_color(checked ? t.accent : t.controlBorder)
+      .text_size(12).text_color(checked ? t.foreground : t.muted).cursor_pointer().hover(s => s.bg(checked ? t.viewedBg : t.hover))
+      .role("button").accessibility_label(`${checked ? "Mark not viewed" : "Mark viewed"}: ${path}`).disabled(this.busy)
+      .child(div().id(`viewed-check:${path}`).size(14).flex_none().rounded(3).border(1).border_color(checked ? t.accent : t.controlBorder)
+        .bg(checked ? t.accent : t.input).text_color("#ffffff").flex().items_center().justify_center()
+        .when(checked, el => el.child(icon("check", 11))))
+      .child(div().child("Viewed"));
   }
   specialRow(row, t) {
     const control = (id, text, name, enabled = true, primary = false) => button(id, text, null, enabled, primary).w(controlWidths[name]).px(0);
     const shell = () => v_flex().h(row.height).w_full().bg(t.background).border_x(1).border_color(t.border);
+    if (row.kind === "bubble-gap") return this.bubbleRow(row, t);
     if (row.kind === "editor") return this.editorRow(row, t);
-    if (row.kind === "editor-actions") return h_flex().h(row.height).px(14).pb(10).gap(8).justify_end().bg(t.comment).border(1).border_t(0).border_color(t.accent)
+    if (row.kind === "editor-actions") return this.bubbleRow(row, t, h_flex().h(row.height).px(14).pb(12).gap(8).justify_end().rounded_b(7).bg(t.comment).border(1).border_t(0).border_color(t.commentBorder)
       .child(control("comment-cancel", "Cancel", "cancel", !this.busy))
-      .child(control("comment-save", row.selection.commentId ? "Save changes" : "Add comment", "save", !this.busy && Boolean(this.note.value().trim()), true));
+      .child(control("comment-save", row.selection.commentId ? "Save changes" : "Add comment", "save", !this.busy && Boolean(this.note.value().trim()), true)));
     if (row.kind === "file") {
-      const checked = Boolean(this.viewed[row.path]), entry = row.entry;
+      const entry = row.entry;
       const add = row.meta.add ?? entry?.data?.add, del = row.meta.del ?? entry?.data?.del;
       return h_flex().id(`card-${row.path}`).h(row.height).px(12).gap(9).items_center().bg(t.raised).rounded_t(6).border(1).border_color(t.border)
         .child(control(`collapse-${row.path}`, this.collapsed.has(row.path) ? "▸" : "▾", "collapse", !this.busy))
@@ -378,21 +451,23 @@ export default class Review extends View {
         .when(add !== null && add !== undefined, el => el.child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)))
         .when(del !== null && del !== undefined, el => el.child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
         .when(Boolean(entry?.changed || entry?.data?.stale || row.meta.status === "draft"), el => el.child(div().text_size(10).text_color(t.blocked).child(row.meta.status === "draft" ? "Outdated draft context" : "Changed since capture")))
-        .when(row.meta.status !== "draft", el => el.child(control(`viewed-${row.path}`, checked ? "☑ Viewed" : "☐ Viewed", "viewed", !this.busy).text_size(11)));
+        .when(row.meta.status !== "draft", el => el.child(this.viewedControl(row.path, t)));
     }
     if (row.kind === "hunk") return h_flex().h(row.height).px(12).gap(8).items_center().bg(t.hunk).border_x(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().font_family(settings().font_family || "JetBrains Mono").text_size(11).text_color(t.dim).child(row.text))
       .when(row.expand, el => el.child(control(`expand-${row.key}`, "Expand context", "expand", !this.busy && !this.selection).h(23).text_size(10)));
-    if (row.kind === "comment") return h_flex().h(row.height).px(12).gap(6).items_center().border(1).border_color(t.commentBorder).bg(t.comment)
-      .child(div().font_semibold().child("You"))
-      .child(div().text_size(10).text_color(row.outdated ? t.blocked : t.muted).child(row.outdated ? `Draft · outdated ${row.comment.side} lines ${row.comment.start}–${row.comment.end}` : "Draft"))
-      .child(div().flex_1())
+    if (row.kind === "comment") return this.bubbleRow(row, t, h_flex().h(row.height).px(12).gap(6).items_center().rounded_t(7).border(1).border_color(t.commentBorder).bg(t.commentHeader)
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(row.outdated ? t.blocked : t.muted).child(`${row.outdated ? "Outdated · " : ""}Comment on ${anchorLabel(row.comment)}`))
       .child(control(`edit-${row.comment.id}`, "Edit", "edit", !this.busy).h(22).text_size(10))
-      .child(control(`delete-${row.comment.id}`, "Delete", "delete", !this.busy).h(22).text_size(10));
-    if (row.kind === "comment-body") return shell().px(12).pt(4).pb(10).border_b(1).border_color(t.commentBorder).bg(t.comment)
-      .child(v_flex().id(`comment-body-${row.comment.id}`).flex_1().min_h(0).gap(6).overflow_y_scrollbar()
+      .child(control(`delete-${row.comment.id}`, "Delete", "delete", !this.busy).h(22).text_size(10)));
+    if (row.kind === "comment-body") return this.bubbleRow(row, t, v_flex().h(row.height).p(12).rounded_b(7).border_x(1).border_b(1).border_color(t.commentBorder).bg(t.comment)
+      .child(v_flex().id(`comment-body-${row.comment.id}`).flex_1().min_h(0).gap(8).overflow_y_scrollbar()
+        .child(h_flex().h(22).flex_none().gap(7).items_center()
+          .child(div().size(22).rounded_full().bg(t.raised).text_color(t.muted).text_size(10).flex().items_center().justify_center().child("Y"))
+          .child(div().font_semibold().child("You"))
+          .child(div().text_size(10).text_color(t.muted).child("Draft")))
         .when(row.outdated, el => el.child(div().p(7).bg(t.hunk).font_family(settings().font_family || "JetBrains Mono").text_size(11).whitespace_normal().child(row.comment.quote)))
-        .child(div().text_size(13).whitespace_normal().child(row.comment.body)));
+        .child(div().text_size(13).whitespace_normal().child(row.comment.body))));
     if (row.kind === "end") return shell().border_b(1).rounded_b(6);
     if (row.kind === "spacer") return div().h(row.height);
     return h_flex().h(row.height).px(12).py(9).gap(7).items_center().bg(t.background).border_x(1).border_color(t.border)

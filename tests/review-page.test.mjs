@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { buildPage, fileTree, hitLine, hitControl, controlWidths, layoutFor } from "../mods/review/page.js";
+import { buildPage, fileTree, hitLine, hitCode, hitControl, controlWidths, layoutFor, commentFrame, anchorLabel } from "../mods/review/page.js";
 
 const meta = { path: "src/a.rs", status: "M", fingerprint: "v1" };
 const data = { snapshot: "frozen", path: meta.path, diff: { rows: [
@@ -25,9 +25,9 @@ test("automatic layouts, stable line keys, inline editor and old-side draft plac
   assert.equal(layoutFor("A"), "unified"); assert.equal(layoutFor("D"), "unified"); assert.equal(layoutFor("M"), "split");
   const selection = { path: meta.path, snapshot: "frozen", side: "old", start: 2, end: 2 };
   const rows = buildPage([meta], entries, [draft], selection);
-  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "comment", "comment-body", "editor", "editor-actions", "end", "spacer"]);
+  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "bubble-gap", "comment", "comment-body", "bubble-gap", "bubble-gap", "editor", "editor-actions", "bubble-gap", "end", "spacer"]);
   assert.equal(rows[2].key, "code:frozen:2:2");
-  assert.equal(rows[3].outdated, false);
+  assert.equal(rows.find(r => r.kind === "comment").outdated, false);
   const changedHunks = { ...data, diff: { rows: [{ kind: "hunk", text: "expanded context" }, ...data.diff.rows.slice(1)] } };
   assert.equal(buildPage([meta], new Map([[meta.path, { data: changedHunks, meta }]]), [], null)[2].key, rows[2].key);
 });
@@ -38,8 +38,8 @@ test("outdated comments retain their quote and can be edited inline without movi
   const index = rows.findIndex(r => r.kind === "comment");
   assert.equal(rows[index].outdated, true); assert.equal(rows[index].comment.quote, "old");
   assert.equal(rows[index + 1].kind, "comment-body");
-  assert.equal(rows[index + 2].kind, "editor");
-  assert.equal(rows[index + 3].kind, "editor-actions");
+  assert.ok(rows.findIndex(r => r.kind === "editor") > index + 1);
+  assert.equal(rows.find(r => r.kind === "editor").selection.snapshot, "previous");
   const orphan = buildPage([], new Map(), [stale], null);
   assert.equal(orphan[0].meta.status, "draft"); assert.equal(orphan.find(r => r.kind === "comment").outdated, true);
 });
@@ -48,10 +48,10 @@ test("collapse hides code and drafts without deleting them; plus hitbox ignores 
   const rows = buildPage([meta], entries, [draft], null, { collapsed: new Set([meta.path]) });
   assert.deepEqual(rows.map(r => r.kind), ["file", "spacer"]);
   const row = buildPage([meta], entries, [], null).find(r => r.kind === "split");
-  assert.deepEqual(hitLine(row, { x: 10, width: 800 }), { side: "old", number: 2 });
-  assert.deepEqual(hitLine(row, { x: 410, width: 800 }), { side: "new", number: 2 });
+  assert.deepEqual(hitLine(row, { x: 63, width: 800 }), { side: "old", number: 2 });
+  assert.deepEqual(hitLine(row, { x: 463, width: 800 }), { side: "new", number: 2 });
   assert.equal(hitLine(row, { x: 600, width: 800 }), null);
-  assert.equal(hitLine({ ...row, old: null }, { x: 10, width: 800 }), null);
+  assert.equal(hitLine({ ...row, old: null }, { x: 63, width: 800 }), null);
 });
 
 test("virtual-row controls have bounded fixed hit zones, separate from code and text input", () => {
@@ -88,6 +88,47 @@ test("wrapping is cached per file response, not redone for comments, progress or
   assert.notEqual(narrow.old.wrapped, first[0].old.wrapped, "resize invalidates the wrapping cache");
   entry.context = 12000;
   assert.equal(buildPage([meta], map, [], null).find(r => r.kind === "hunk").expand, false);
+});
+
+test("comment cards are inset, capped and align with their old/new code lane", () => {
+  for (const width of [300, 600, 800, 1200, 2000]) for (const layout of ["split", "unified"]) for (const side of ["old", "new"]) {
+    const frame = commentFrame(width, layout, side);
+    assert.ok(frame.x > 0 && frame.width > 0 && frame.width <= 760);
+    assert.ok(frame.x + frame.width <= width - 16);
+  }
+  const old = commentFrame(1000, "split", "old"), next = commentFrame(1000, "split", "new");
+  assert.equal(next.x - old.x, 500);
+  assert.ok(old.width < 500 && next.width < 500);
+  assert.equal(commentFrame(1200, "unified", "new").width, 760);
+  assert.equal(anchorLabel({ side: "old", start: 4, end: 4 }), "line L4");
+  assert.equal(anchorLabel({ side: "new", start: 4, end: 6 }), "lines R4–R6");
+});
+
+test("split comment spacing keeps the opposite code lane neutral", () => {
+  const selection = { path: meta.path, snapshot: data.snapshot, side: "new", start: 2, end: 2 };
+  const editor = buildPage([meta], entries, [], selection).find(r => r.kind === "editor");
+  assert.equal(editor.surround.old, "empty"); assert.equal(editor.surround.new, "new");
+  const saved = buildPage([meta], entries, [draft], null).find(r => r.kind === "comment");
+  assert.equal(saved.surround.old, "old"); assert.equal(saved.surround.new, "empty");
+});
+
+test("comment controls hit the inset card, not the same coordinates elsewhere in the diff", () => {
+  const frame = commentFrame(1000, "split", "new"), row = { kind: "editor-actions", frame };
+  const x = frame.x + frame.width - 30;
+  assert.equal(hitControl(row, { x, width: 1000 }), "save");
+  assert.equal(hitControl(row, { x: 100, width: 1000 }), null);
+  assert.equal(hitControl(row, { x: 990, width: 1000 }), null);
+  const header = { kind: "comment", frame };
+  assert.equal(hitControl(header, { x, width: 1000 }), "delete");
+});
+
+test("line-number and code clicks are distinct from the floating + gutter target", () => {
+  const row = buildPage([meta], entries, [], null).find(r => r.kind === "split");
+  assert.deepEqual(hitCode(row, { x: 10, width: 800 }), { side: "old", number: 2, plus: false });
+  assert.deepEqual(hitCode(row, { x: 600, width: 800 }), { side: "new", number: 2, plus: false });
+  assert.equal(hitLine(row, { x: 10, width: 800 }), null);
+  assert.deepEqual(hitLine(row, { x: 463, width: 800 }), { side: "new", number: 2 });
+  assert.equal(hitCode({ ...row, new: null }, { x: 600, width: 800 }), null);
 });
 
 test("repeated hunk annotations have unique virtual keys", () => {

@@ -51,20 +51,28 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 
 - The left panel contains only the changed-file tree. Collapse folders or click
   a file to jump to its card in the single scrolling review page.
+- Click a line number or code line to give it a persistent blue outline.
+  This visual selection is independent of the current comment editor's anchor.
+  Native hover reveals a filled blue **+**, even while another line is selected.
+- Comment/editor cards are inset below the code, capped at 760 px and aligned
+  with their old/new split lane (spanning narrow layouts when needed).
 - Cards load their diffs as they become visible. **Modified files are split**;
   **new files are unified**; deleted files have a single old-code column. Lines
   wrap to the available width. Difftastic aligns existing code and highlights
   changed tokens; formatting differences remain visible too.
 - Hover a code line to reveal the blue **+** in its gutter. Click it to open a
-  textarea directly beneath that line, spanning the card's width. Click the
-  other side's + to anchor a comment to removed code.
-- **Shift-click another +** to extend the comment to a range on the same file,
-  snapshot and side (up to 50 lines). Clicking code text does not open a comment.
+  textarea in an inset card beneath that line. Click the other side's + to
+  anchor a comment to removed code.
+- **Shift-click lines or another +** for a range on the same file, snapshot and
+  side (up to 50 lines). Clicking code text only outlines the line; it never
+  relocates an open comment. Click + inside an outlined range to comment on it.
 - **Add comment** saves a local draft; it does not send anything. Drafts display
   inline with **Edit** and **Delete**. The editor disappears after saving.
 - A file's **Viewed** checkbox records review progress and collapses its card.
   Its viewed flag resets when the file/base change token changes. Viewed is
-  unrelated to staging or committing.
+  unrelated to staging or committing. Checkboxes update optimistically per file,
+  never pulse/dim the whole page, and roll back that file only if saving fails.
+  Pending/deferred manifests preserve these local updates.
 - **Expand context** adds ten surrounding lines, always from the same frozen
   snapshot. It cannot accidentally pull newer agent edits into an old comment.
 - File-tree navigation/scrolling preserves open comment text. Save or Cancel
@@ -72,8 +80,8 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 
 The whole page uses one virtual list of freshly painted native elements. Row
 controls use a single list-owned handler with stable keys and fixed hit zones;
-comment/editor action strips are separate rows. No cached elements or nested
-JavaScript view entities are mounted in deferred rows: in Herdr 0.1.13 those
+comment/editor action strips are separate rows and share their card's hit bounds.
+No cached elements or nested JavaScript view entities are mounted in deferred rows: in Herdr 0.1.13 those
 mounts can be released offscreen, producing a blank pane on scrolling. The
 native textarea's **state**, not its row view, stays alive while offscreen.
 
