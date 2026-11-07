@@ -1,0 +1,16 @@
+**/target/
+node_modules/
+*.d.ts
+jsconfig.json
+*.error
+.DS_Store
+/data/
+/telemetry/
+/settings.json
+/view.json
+/shared.json
+/seen.json
+/installed.json
+/window.json
+/windows.json
+*.sock

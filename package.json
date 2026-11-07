@@ -1,0 +1,10 @@
+{
+  "name": "herdr-changes",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Native Herdr agent review tabs with a Rust and Difftastic backend",
+  "scripts": {
+    "test": "node --test tests/review*.test.mjs"
+  }
+}

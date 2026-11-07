@@ -1,0 +1,26 @@
+Third-party notices
+===================
+
+Herdr tab bar — Apache License 2.0
+----------------------------------
+
+mods/review-tabs/main.js and mods/review-tabs/mod.json are modified versions
+of the "tabs" mod shipped with Herdr 0.1.13 (https://herdr.dev). The clone
+metadata is retained in mod.json. The changes add the review-tab launcher;
+Herdr's existing tab and panel behavior is preserved.
+
+mods/review-tabs/win-close.svg, win-max.svg, win-min.svg and win-restore.svg
+are the window-control vectors copied with that mod.
+
+The Herdr-derived portions remain under the Apache License, Version 2.0.
+The full license is provided in LICENSES/Apache-2.0.txt. This project's MIT
+license does not replace the original terms. Keep these notices when
+redistributing the cloned mod.
+
+The reviewer/backend and launcher additions are independent project code.
+Difftastic (MIT) and Herdr are invoked/provided separately, not redistributed
+as application binaries in this source repository. Cargo dependency licenses
+remain those declared by their respective packages.
+
+GitHub and GitHub Desktop are visual references only. No code or logos from
+GitHub Desktop or the third-party herdr-reviewer project were imported.
