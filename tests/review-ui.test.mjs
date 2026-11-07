@@ -21,7 +21,7 @@ function harness({ root = "/repo", register = false, registry = {} } = {}) {
     const proxy = new Proxy({}, { get: (_, name) => (...args) => {
       if (deferred && String(name).startsWith("on_")) assert.fail("Handlers must not be registered in deferred code rows");
       if (name === "id") { id = args[0]; ids.push(id); styles.set(id, {}); }
-      if (id && ["opacity", "bg", "border_color", "border_x", "border_t", "border_b", "rounded_t", "rounded_b", "disabled", "size", "visible", "w", "tooltip", "accessibility_label"].includes(name)) styles.get(id)[name] = args[0];
+      if (id && ["opacity", "bg", "border_color", "border_x", "border_t", "border_b", "rounded_t", "rounded_b", "disabled", "size", "visible", "w", "tooltip", "accessibility_label", "overflow_y_scrollbar"].includes(name)) styles.get(id)[name] = args[0];
       if (id && name === "size_range") styles.get(id)[name] = args;
       if (id && name === "on_click") handlers.set(`${id}:click`, args[0]);
       if (id && name === "on_mouse_down") handlers.set(`${id}:down`, args[1]);
@@ -39,7 +39,7 @@ function harness({ root = "/repo", register = false, registry = {} } = {}) {
   function state() {
     let value = "";
     const events = {};
-    return { events, value: () => value, set_value: v => { value = v; }, focus() {}, on(event, fn) { events[event] = fn; } };
+    return { events, value: () => value, set_value: v => { value = v; }, focus() {}, set_auto_grow(...rows) { this.autoGrow = rows; }, on(event, fn) { events[event] = fn; } };
   }
   const file = (path, snapshot = `snapshot-${backend.version}-${path}`) => ({
     snapshot, path, context: 3, stale: false, add: 1, del: path === "new.rs" ? 0 : 1,
@@ -146,7 +146,7 @@ function harness({ root = "/repo", register = false, registry = {} } = {}) {
     else {
       let row, action;
       if (id.startsWith("comment-")) { row = view.rows.find(r => r.kind === "editor-actions"); action = id === "comment-save" ? "save" : "cancel"; }
-      else { action = id.startsWith("edit-") ? "edit" : "delete"; row = view.rows.find(r => r.kind === "comment" && `${action}-${r.comment.id}` === id); }
+      else { action = id.startsWith("edit-") ? "edit" : "delete"; row = view.rows.find(r => r.kind === "comment-actions" && `${action}-${r.comment.id}` === id); }
       assert.ok(row);
       const offset = action === "edit" ? controlWidths.delete + 6 : action === "cancel" ? controlWidths.save + 8 : 0;
       view.press = { width: 800, x: row.frame.x + row.frame.width - (row.kind === "editor-actions" ? 14 : 12) - offset - controlWidths[action] / 2 };
@@ -282,6 +282,68 @@ test("inline draft Edit/Delete use the list-owned handler and preserve saved anc
   await h.click("delete-c1"); assert.equal(h.view.comments.length, 0);
 });
 
+test("editing replaces the saved card in place; cancel restores it and save updates the same comment", async () => {
+  const h = harness(); await h.comment(); h.render();
+  const saved = h.view.comments[0], rows = h.view.rows;
+  const start = rows.findIndex(row => row.key === `comment-top:${saved.id}`);
+  const prefix = rows.slice(0, start).map(row => row.key), scrolls = h.scrolls.length;
+  await h.click("edit-c1");
+  assert.deepEqual(h.view.rows.slice(0, start).map(row => row.key), prefix);
+  assert.equal(h.view.rows.filter(row => row.kind === "editor").length, 1);
+  assert.ok(!h.view.rows.some(row => row.comment?.id === "c1" && row.kind.startsWith("comment")));
+  assert.equal(h.scrolls.length, scrolls, "Edit does not relocate the viewport");
+  h.type("Unsaved replacement"); await h.click("comment-cancel");
+  assert.equal(h.view.comments[0].body, saved.body);
+  assert.ok(h.view.rows.some(row => row.kind === "comment-body"));
+  await h.click("edit-c1"); h.type("Updated in place"); await h.click("comment-save");
+  assert.equal(h.view.comments.length, 1); assert.equal(h.view.comments[0].id, saved.id);
+  assert.equal(h.view.comments[0].snapshot, saved.snapshot); assert.equal(h.view.comments[0].start, saved.start);
+  assert.equal(h.view.comments[0].body, "Updated in place");
+});
+
+test("saved comments have bottom action strips, no author decoration and no inner scrollbar", async () => {
+  const h = harness(); await h.comment(); h.render();
+  for (const label of ["Y", "You", "Draft"]) assert.ok(!h.texts.includes(label));
+  assert.ok(h.view.rows.findIndex(row => row.kind === "comment-actions") > h.view.rows.findIndex(row => row.kind === "comment-body"));
+  assert.equal(h.styles.get("comment-body-c1").overflow_y_scrollbar, undefined);
+  const footer = h.view.rows.find(row => row.kind === "comment-actions");
+  assert.equal(hitControl(footer, { x: footer.frame.x + footer.frame.width - 30, width: 800 }), "delete");
+  assert.equal(hitControl(h.view.rows.find(row => row.kind === "comment"), { x: 780, width: 800 }), null);
+});
+
+test("native-sized comment bodies and editors grow and shrink without changing anchors or requesting scrolls", async () => {
+  const h = harness(); await h.comment(); h.render();
+  const body = h.view.rows.find(row => row.kind === "comment-body"), scrolls = h.scrolls.length;
+  h.handlers.get("measure-comment-body-c1:size")({ width: body.frame.width, height: 950 }, h.cx);
+  assert.equal(h.view.rows.find(row => row.kind === "comment-body").height, 950, "saved comments have no 300px cap");
+  h.render(); const notifications = h.notifications.length;
+  h.handlers.get("measure-comment-body-c1:size")({ width: body.frame.width, height: 950 }, h.cx);
+  assert.equal(h.notifications.length, notifications, "stable native sizes never create a redraw loop");
+  await h.click("edit-c1"); h.type("Wrapped text\n".repeat(80)); h.render();
+  const selection = h.view.selection, snapshot = selection.snapshot, grow = h.handlers.get("measure-inline-comment:size");
+  grow({ height: 1700 }, h.cx);
+  assert.equal(h.view.rows.find(row => row.kind === "editor").height, 1700);
+  assert.equal(h.view.note.autoGrow[0], 4); assert.ok(h.view.note.autoGrow[1] > 4000);
+  h.type("Short"); h.render();
+  h.handlers.get("measure-inline-comment:size")({ height: 160 }, h.cx);
+  assert.equal(h.view.rows.find(row => row.kind === "editor").height, 160);
+  assert.equal(h.view.selection, selection); assert.equal(h.view.selection.snapshot, snapshot);
+  assert.equal(h.scrolls.length, scrolls);
+  await h.click("comment-cancel");
+  const rows = h.view.rows;
+  grow({ height: 2000 }, h.cx); h.view.measureComment(body, { height: NaN }, h.cx);
+  assert.equal(h.view.rows, rows, "obsolete editor and invalid size events are ignored");
+});
+
+test("text mirrors stay eager and never mount a second native textarea or register virtual-row handlers", async () => {
+  const h = harness(); await h.comment(); await h.click("edit-c1"); h.render();
+  const list = h.lists.at(-1);
+  for (let i = 0; i < 10; i++) assert.doesNotThrow(() => list.draw());
+  assert.ok(h.handlers.has("measure-inline-comment:size"));
+  assert.ok(!h.handlers.has("inline-comment-editor:size"));
+  assert.ok(!h.handlers.has("edit-c1:click"));
+});
+
 test("background changes never move an open editor or overwrite a just-saved comment", async () => {
   const h = harness(); await h.load(); h.plus(); h.type("Keep this draft");
   const snapshot = h.view.selection.snapshot;
@@ -412,12 +474,14 @@ test("visible-file demand is serialized and bounds the prefetch queue", async ()
   assert.ok(h.calls.filter(c => c.action === "open").length <= 4, "one in-flight diff plus at most three queued");
 });
 
-test("typing only redraws the page when comment-button availability changes", async () => {
+test("typing updates the inert sizing mirror without rebuilding code or moving the viewport", async () => {
   const h = harness(); await h.load(); h.plus();
-  h.type("x"); const notifications = h.notifications.length;
-  h.type("xy"); h.type("xyz");
-  assert.equal(h.notifications.length, notifications, "native textarea owns ordinary keystroke redraws");
-  h.type(""); assert.equal(h.notifications.length, notifications + 1);
+  const rows = h.view.rows, scrolls = h.scrolls.length, calls = h.calls.length;
+  h.type("x"); h.type("xy"); h.type("xyz"); h.render();
+  assert.equal(h.view.rows, rows, "code/virtual sizes rebuild only after the measured height changes");
+  assert.equal(h.scrolls.length, scrolls); assert.equal(h.calls.length, calls);
+  assert.ok(h.texts.includes("xyz\u200b"));
+  h.type(""); assert.equal(h.view.canSaveNote, false);
 });
 
 test("hidden reviews pause queued diff work and resume when shown", async () => {

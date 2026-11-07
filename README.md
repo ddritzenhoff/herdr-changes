@@ -21,8 +21,10 @@ beside the code, then send one feedback batch to your coding agent.
   and changed-token highlights, with a Git text fallback.
 - Click a line or line number for a persistent blue outline. Hovering another
   line independently reveals its blue **+**. Click + to open an inset comment
-  card. Shift-click lines or **+** for a range. Saved drafts can be edited/deleted
-  and survive restarts.
+  card. Shift-click lines or **+** for a range. Saved comments survive restarts
+  and edit in place, without a second textbox or author/draft badges. Actions
+  sit at the bottom; both saved comments and editors grow with their content
+  instead of introducing an inner scrollbar.
 - Viewed checkboxes track progress with immediate per-file updates, without
   flickering other controls.
 - Gutter arrows reveal up to ten unchanged lines above/below a hunk, or from

@@ -64,8 +64,10 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 - Click a line number or code line to give it a persistent blue outline.
   This visual selection is independent of the current comment editor's anchor.
   Native hover reveals a filled blue **+**, even while another line is selected.
-- Comment/editor cards are inset below the code, capped at 760 px and aligned
-  with their old/new split lane (spanning narrow layouts when needed).
+- Comment/editor cards are inset below the code, capped at 760 px wide and aligned
+  with their old/new split lane (spanning narrow layouts when needed). Their height
+  grows with wrapped text and newlines; long comments scroll with the page, not
+  inside a nested scrolling box.
 - Cards load their diffs as they become visible. **Modified files are split**;
   **new files are unified**; deleted files have a single old-code column. Lines
   wrap to the available width. Difftastic aligns existing code and highlights
@@ -76,8 +78,12 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 - **Shift-click lines or another +** for a range on the same file, snapshot and
   side (up to 50 lines). Clicking code text only outlines the line; it never
   relocates an open comment. Click + inside an outlined range to comment on it.
-- **Add comment** saves a local draft; it does not send anything. Drafts display
-  inline with **Edit** and **Delete**. The editor disappears after saving.
+- **Add comment** saves a local draft; it does not send anything. Saved comments
+  have no avatar, “You” or “Draft” badges. **Edit**/**Delete** sit at the bottom.
+  **Edit** replaces that same card with an editor, rather than adding a second
+  textbox beneath it. **Cancel** restores the saved text; **Save changes** updates
+  the existing comment without changing its anchor. Editor actions also sit at
+  the bottom; the editor disappears after saving.
 - A file's **Viewed** checkbox records review progress and collapses its card.
   Its viewed flag resets when the file/base change token changes. Viewed is
   unrelated to staging or committing. Checkboxes update optimistically per file,
@@ -99,6 +105,9 @@ comment/editor action strips are separate rows and share their card's hit bounds
 No cached elements or nested JavaScript view entities are mounted in deferred rows: in Herdr 0.1.13 those
 mounts can be released offscreen, producing a blank pane on scrolling. The
 native textarea's **state**, not its row view, stays alive while offscreen.
+Intrinsic text heights are measured by inert, offscreen text-only mirrors in the
+ordinary render tree, since this Herdr version forbids size handlers inside a
+virtual row. No second native textarea is mounted for measurement.
 
 Visible-file demand is drained outside layout every 120 ms, with one backend
 request at a time and at most three queued files. This scheduler does not redraw

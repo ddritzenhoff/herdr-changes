@@ -37,7 +37,7 @@ export default class Review extends View {
     this.files = []; this.comments = []; this.viewed = {}; this.entries = new Map(); this.rows = [];
     this.collapsed = new Set(); this.folded = new Set(); this.queue = []; this.deferred = new Map();
     this.busy = false; this.pumping = false; this.scanning = false; this.revision = 0; this.rpc = Promise.resolve();
-    this.visiblePaths = []; this.viewedPending = new Map();
+    this.visiblePaths = []; this.viewedPending = new Map(); this.commentHeights = new Map();
     const filePane = filePanePreferences(shared(filePaneKey));
     this.filePaneWidth = filePane.width; this.filePaneCollapsed = filePane.collapsed;
     // Native groups retain geometry by id, even across a mod reload. Use one
@@ -49,9 +49,12 @@ export default class Review extends View {
     cx.timer.every(120, cx => this.loadVisible(cx));
     this.scroll = VirtualListScrollHandle.new();
     this.note = TextareaState.new({ placeholder: "Leave a comment…", rows: 4 });
+    // Native wrapping determines the height, not a fixed scrolling textbox.
+    // This accommodates far more lines than the backend's 4,000-byte limit.
+    this.note.set_auto_grow(4, 10000);
     this.note.on("change", (_e, cx) => {
       const enabled = Boolean(this.note.value().trim());
-      if (enabled !== this.canSaveNote) { this.canSaveNote = enabled; this.notify(cx); }
+      if (this.selection || enabled !== this.canSaveNote) { this.canSaveNote = enabled; this.notify(cx); }
     });
     this.note.on("submit", (e, cx) => { if (e?.secondary) this.saveComment(cx); });
     this.previewEditor = EditorState.new({ value: "", readonly: true, line_numbers: false, folding: false, soft_wrap: true, font_size: 12 });
@@ -107,7 +110,8 @@ export default class Review extends View {
   rebuild(_cx) {
     this.canSaveNote = Boolean(this.note.value().trim());
     this.manifestSignature = JSON.stringify([this.root, this.base, this.files, this.comments, this.viewed]);
-    this.rows = buildPage(this.files, this.entries, this.comments, this.selection, { width: this.width || 840, viewportHeight: this.pageHeight || 0, collapsed: this.collapsed });
+    this.rows = buildPage(this.files, this.entries, this.comments, this.selection, { width: this.width || 840, viewportHeight: this.pageHeight || 0, collapsed: this.collapsed,
+      noteText: this.note.value(), commentHeights: this.commentHeights });
     const navigation = fileNavigation(this.rows, this.activePath, this.pageHeight || 0);
     this.items = navigation.items; this.jumpTarget = navigation.target;
     this.byKey = new Map(this.items.filter(item => item.row).map(item => [item.key, item.row]));
@@ -342,7 +346,7 @@ export default class Review extends View {
     this.selection = { ...c, commentId: c.id, anchor: c.start };
     this.highlight = { path: c.path, snapshot: c.snapshot, side: c.side, start: c.start, end: c.end, anchor: c.start };
     this.note.set_value(c.body); this.jumpPath = null; this.collapsed.delete(c.path);
-    this.rebuild(cx); this.scrollTo("inline-editor"); this.note.focus(); this.notify(cx);
+    this.rebuild(cx); this.note.focus(); this.notify(cx);
   }
   deleteComment(id, cx) {
     this.operation(cx, async cx => {
@@ -430,15 +434,29 @@ export default class Review extends View {
     if (content) box.child(div().absolute().left(row.frame.x).top(0).w(row.frame.width).h(row.height).child(content));
     return box;
   }
-  editorRow(row, t) {
+  measureComment(row, size, cx, noteText) {
+    const current = this.byKey.get(row.key);
+    // Size callbacks can arrive after a save, replacement, resize or close.
+    if (this.closed || current?.measureKey !== row.measureKey || (row.kind === "editor" && (this.selection !== row.selection || noteText !== this.note.value()))) return;
+    if (!Number.isFinite(size.height) || size.height <= 0 || Math.abs(size.height - current.height) <= 1) return;
+    this.commentHeights.set(row.measureKey, size.height);
+    this.rebuild(cx); this.notify(cx);
+  }
+  editorContent(row, t, measuring = false) {
     const s = row.selection;
-    return this.bubbleRow(row, t, v_flex().id("inline-comment-editor").h(row.height).px(12).py(12).gap(10).rounded_t(7).bg(t.comment).border(1).border_b(0).border_color(t.commentBorder)
-      .child(h_flex().gap(8).items_center().flex_none()
-        .child(icon("comment", 18).text_color(t.muted))
-        .child(div().min_w(0).truncate().text_size(14).font_semibold().child(`${s.commentId ? "Edit comment" : "Add a comment"} on ${anchorLabel(s)}`)))
+    return v_flex().id(measuring ? "measure-inline-comment" : "inline-comment-editor").w_full().flex_none().px(12).py(12).gap(10).rounded_t(7).bg(t.comment).border(1).border_b(0).border_color(t.commentBorder)
+      .child(div().w_full().flex_none().truncate().text_size(14).font_semibold().child(`${s.commentId ? "Edit comment" : "Add a comment"} on ${anchorLabel(s)}`))
       .when(this.changedWhileEditing, el => el.child(div().flex_none().text_size(10).text_color(t.blocked).child("File changed · original snapshot retained")))
-      .child(div().flex_1().min_h(0).px(10).py(7).bg(t.input).rounded(6).border_1().border_color(t.controlBorder)
-        .child(Textarea.new(this.note).size_full().text_size(13))));
+      .when(row.outdated, el => el.child(div().w_full().flex_none().p(7).bg(t.hunk).font_family(settings().font_family || "JetBrains Mono").text_size(11).line_height("20px").whitespace_normal().child(row.comment.quote)))
+      .child(div().w_full().flex_none().px(10).py(7).bg(t.input).rounded(6).border_1().border_color(t.controlBorder)
+        .child(measuring
+          ? div().w_full().min_h(80).text_size(13).line_height("20px").whitespace_normal().child(`${this.note.value()}\u200b`)
+          : Textarea.new(this.note).w_full().text_size(13).line_height("20px")));
+  }
+  commentBody(row, t, measuring = false) {
+    return v_flex().id(`${measuring ? "measure-" : ""}comment-body-${row.comment.id}`).w_full().flex_none().p(12).gap(8).border_x(1).border_color(t.commentBorder).bg(t.comment)
+      .when(row.outdated, el => el.child(div().w_full().flex_none().p(7).bg(t.hunk).font_family(settings().font_family || "JetBrains Mono").text_size(11).line_height("20px").whitespace_normal().child(row.comment.quote)))
+      .child(div().w_full().flex_none().text_size(13).line_height("20px").whitespace_normal().child(row.comment.body));
   }
   viewedControl(path, t) {
     const checked = Boolean(this.viewed[path]);
@@ -455,7 +473,7 @@ export default class Review extends View {
     const control = (id, text, name, enabled = true, primary = false) => button(id, text, null, enabled, primary).w(controlWidths[name]).px(0);
     const shell = () => v_flex().h(row.height).w_full().bg(t.background).border_x(1).border_color(t.border);
     if (row.kind === "bubble-gap") return this.bubbleRow(row, t);
-    if (row.kind === "editor") return this.editorRow(row, t);
+    if (row.kind === "editor") return this.bubbleRow(row, t, this.editorContent(row, t));
     if (row.kind === "editor-actions") return this.bubbleRow(row, t, h_flex().h(row.height).px(14).pb(12).gap(8).justify_end().rounded_b(7).bg(t.comment).border(1).border_t(0).border_color(t.commentBorder)
       .child(control("comment-cancel", "Cancel", "cancel", !this.busy))
       .child(control("comment-save", row.selection.commentId ? "Save changes" : "Add comment", "save", !this.busy && Boolean(this.note.value().trim()), true)));
@@ -478,18 +496,12 @@ export default class Review extends View {
         .tooltip(`Expand ${Math.min(10, row.gap.count)} lines ${row.expand === "up" ? "above" : "below"}`)
         .child(icon(`expand-${row.expand}`, 18))))
       .child(div().flex_1().min_w(0).px(12).truncate().font_family(settings().font_family || "JetBrains Mono").text_size(11).text_color(t.dim).child(row.text));
-    if (row.kind === "comment") return this.bubbleRow(row, t, h_flex().h(row.height).px(12).gap(6).items_center().rounded_t(7).border(1).border_color(t.commentBorder).bg(t.commentHeader)
-      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(row.outdated ? t.blocked : t.muted).child(`${row.outdated ? "Outdated · " : ""}Comment on ${anchorLabel(row.comment)}`))
-      .child(control(`edit-${row.comment.id}`, "Edit", "edit", !this.busy).h(22).text_size(10))
-      .child(control(`delete-${row.comment.id}`, "Delete", "delete", !this.busy).h(22).text_size(10)));
-    if (row.kind === "comment-body") return this.bubbleRow(row, t, v_flex().h(row.height).p(12).rounded_b(7).border_x(1).border_b(1).border_color(t.commentBorder).bg(t.comment)
-      .child(v_flex().id(`comment-body-${row.comment.id}`).flex_1().min_h(0).gap(8).overflow_y_scrollbar()
-        .child(h_flex().h(22).flex_none().gap(7).items_center()
-          .child(div().size(22).rounded_full().bg(t.raised).text_color(t.muted).text_size(10).flex().items_center().justify_center().child("Y"))
-          .child(div().font_semibold().child("You"))
-          .child(div().text_size(10).text_color(t.muted).child("Draft")))
-        .when(row.outdated, el => el.child(div().p(7).bg(t.hunk).font_family(settings().font_family || "JetBrains Mono").text_size(11).whitespace_normal().child(row.comment.quote)))
-        .child(div().text_size(13).whitespace_normal().child(row.comment.body))));
+    if (row.kind === "comment") return this.bubbleRow(row, t, h_flex().h(row.height).px(12).items_center().rounded_t(7).border(1).border_color(t.commentBorder).bg(t.commentHeader)
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(row.outdated ? t.blocked : t.muted).child(`${row.outdated ? "Outdated · " : ""}Comment on ${anchorLabel(row.comment)}`)));
+    if (row.kind === "comment-body") return this.bubbleRow(row, t, this.commentBody(row, t));
+    if (row.kind === "comment-actions") return this.bubbleRow(row, t, h_flex().h(row.height).px(12).pb(12).gap(6).justify_end().rounded_b(7).bg(t.comment).border_x(1).border_b(1).border_color(t.commentBorder)
+      .child(control(`edit-${row.comment.id}`, "Edit", "edit", !this.busy))
+      .child(control(`delete-${row.comment.id}`, "Delete", "delete", !this.busy)));
     if (row.kind === "end") return shell().border_b(1).rounded_b(6);
     if (row.kind === "spacer") return div().h(row.height);
     return h_flex().h(row.height).px(12).py(9).gap(7).items_center().bg(t.background).border_x(1).border_color(t.border)
@@ -577,9 +589,17 @@ export default class Review extends View {
   }
   page(t) {
     const items = this.items || [], activePath = this.activePath, collapsed = this.collapsed.has(activePath);
-    // Keep a coherent list version for the whole native layout pass. Nothing
-    // here owns a JS row entity, event handler, or cached native element.
-    return v_flex().id("review-page").flex_1().h_full().min_w(0).min_h(0).px(16).pt(12).bg(t.canvas)
+    const noteText = this.note.value();
+    // This Herdr version forbids handlers inside deferred virtual rows. Measure
+    // inert text-only mirrors in the eager tree instead, at the exact card
+    // width/font. Never duplicate the native textarea or cache row elements.
+    const measurements = this.rows.filter(row => row.measureKey).map(row =>
+      div().id(`measure:${row.key}`).absolute().left(-100000).top(0).w(row.frame.width)
+        .child((row.kind === "editor" ? this.editorContent(row, t, true) : this.commentBody(row, t, true))
+          .on_size_change((size, cx) => this.measureComment(row, size, cx, noteText))));
+    // Keep a coherent list version for the whole native layout pass.
+    return v_flex().id("review-page").relative().flex_1().h_full().min_w(0).min_h(0).px(16).pt(12).bg(t.canvas)
+      .children(measurements)
       .on_size_change((size, cx) => {
         const width = Math.max(200, size.width - 32), height = Math.max(0, size.height - 12);
         if (Math.abs((this.width || 0) - width) > 1 || Math.abs((this.pageHeight || 0) - height) > 1) {

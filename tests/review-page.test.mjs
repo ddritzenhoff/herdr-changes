@@ -25,7 +25,7 @@ test("automatic layouts, stable line keys, inline editor and old-side draft plac
   assert.equal(layoutFor("A"), "unified"); assert.equal(layoutFor("D"), "unified"); assert.equal(layoutFor("M"), "split");
   const selection = { path: meta.path, snapshot: "frozen", side: "old", start: 2, end: 2 };
   const rows = buildPage([meta], entries, [draft], selection);
-  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "bubble-gap", "comment", "comment-body", "bubble-gap", "bubble-gap", "editor", "editor-actions", "bubble-gap", "end", "spacer"]);
+  assert.deepEqual(rows.map(r => r.kind), ["file", "hunk", "split", "bubble-gap", "comment", "comment-body", "comment-actions", "bubble-gap", "bubble-gap", "editor", "editor-actions", "bubble-gap", "end", "spacer"]);
   assert.equal(rows[2].key, "code:frozen:2:2");
   assert.equal(rows.find(r => r.kind === "comment").outdated, false);
   const changedHunks = { ...data, diff: { rows: [{ kind: "hunk", text: "expanded context" }, ...data.diff.rows.slice(1)] } };
@@ -35,13 +35,28 @@ test("automatic layouts, stable line keys, inline editor and old-side draft plac
 test("outdated comments retain their quote and can be edited inline without moving anchors", () => {
   const stale = { ...draft, snapshot: "previous" };
   const rows = buildPage([meta], entries, [stale], { ...stale, commentId: stale.id });
-  const index = rows.findIndex(r => r.kind === "comment");
-  assert.equal(rows[index].outdated, true); assert.equal(rows[index].comment.quote, "old");
-  assert.equal(rows[index + 1].kind, "comment-body");
-  assert.ok(rows.findIndex(r => r.kind === "editor") > index + 1);
-  assert.equal(rows.find(r => r.kind === "editor").selection.snapshot, "previous");
+  const editor = rows.find(r => r.kind === "editor");
+  assert.equal(editor.outdated, true); assert.equal(editor.comment.quote, "old");
+  assert.ok(!rows.some(r => ["comment", "comment-body", "comment-actions"].includes(r.kind)), "editing replaces the saved card instead of appending another");
+  assert.equal(editor.selection.snapshot, "previous");
   const orphan = buildPage([], new Map(), [stale], null);
   assert.equal(orphan[0].meta.status, "draft"); assert.equal(orphan.find(r => r.kind === "comment").outdated, true);
+});
+
+test("long saved comments, quotes and editors reserve their full height instead of a scrolling cap", () => {
+  const long = { ...draft, body: "A line\n".repeat(100), quote: "Old code\n".repeat(30) };
+  const rows = buildPage([meta], entries, [long], null);
+  const body = rows.find(row => row.kind === "comment-body");
+  assert.ok(body.height > 2000);
+  const measured = buildPage([meta], entries, [long], null, { commentHeights: new Map([[body.measureKey, 2345]]) });
+  assert.equal(measured.find(row => row.kind === "comment-body").height, 2345);
+  const selection = { ...draft, commentId: draft.id };
+  const editing = buildPage([meta], entries, [long], selection, { noteText: long.body });
+  assert.ok(editing.find(row => row.kind === "editor").height > 2000);
+  assert.ok(!editing.some(row => row.kind === "comment-body"));
+  const narrow = buildPage([meta], entries, [long], selection, { width: 300, noteText: "W".repeat(1000) });
+  const wide = buildPage([meta], entries, [long], selection, { width: 1200, noteText: "W".repeat(1000) });
+  assert.ok(narrow.find(row => row.kind === "editor").height > wide.find(row => row.kind === "editor").height);
 });
 
 test("trailing room lets the last file reach the top for loaded, pending, error, draft and collapsed cards", () => {
@@ -100,8 +115,9 @@ test("virtual-row controls have bounded fixed hit zones, separate from code and 
   assert.equal(hit("hunk", 35, { expand: "up" }), "expand");
   assert.equal(hit("hunk", 750, { expand: "up" }), null);
   assert.equal(hit("hunk", 35, { expand: false }), null);
-  assert.equal(hit("comment", 780), "delete");
-  assert.equal(hit("comment", 700), "edit");
+  assert.equal(hit("comment", 780), null, "comment headers no longer own actions");
+  assert.equal(hit("comment-actions", 780), "delete");
+  assert.equal(hit("comment-actions", 700), "edit");
   assert.equal(hit("comment-body", 780), null);
   assert.equal(hit("editor", 780), null);
   assert.equal(hit("editor-actions", 780), "save");
@@ -155,8 +171,8 @@ test("comment controls hit the inset card, not the same coordinates elsewhere in
   assert.equal(hitControl(row, { x, width: 1000 }), "save");
   assert.equal(hitControl(row, { x: 100, width: 1000 }), null);
   assert.equal(hitControl(row, { x: 990, width: 1000 }), null);
-  const header = { kind: "comment", frame };
-  assert.equal(hitControl(header, { x, width: 1000 }), "delete");
+  const footer = { kind: "comment-actions", frame };
+  assert.equal(hitControl(footer, { x, width: 1000 }), "delete");
 });
 
 test("line-number and code clicks are distinct from the floating + gutter target", () => {

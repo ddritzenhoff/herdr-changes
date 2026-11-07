@@ -55,29 +55,35 @@ const surroundFor = (layout, row, side) => ({
 });
 
 // Pure flattened page data; no native elements, entities or handlers are cached.
-export function buildPage(files, entries, comments, selection, { width = 840, viewportHeight = 0, collapsed = new Set() } = {}) {
+export function buildPage(files, entries, comments, selection, { width = 840, viewportHeight = 0, collapsed = new Set(), noteText = "", commentHeights = new Map() } = {}) {
   const rows = [], columns = Math.max(12, Math.floor((width - 32) / 7.3));
   const paths = new Set(files.map(f => f.path));
   const all = [...files, ...[...new Set(comments.map(c => c.path))].filter(p => !paths.has(p)).map(path => ({ path, status: "draft", fingerprint: "" }))];
   // Give action strips their own keys so a single list-owned click callback
   // can hit-test by x only, without guessing a scrolled row's y coordinate.
-  const editor = (path, layout, source) => {
+  const editor = (path, layout, source, comment, outdated = false) => {
     const frame = commentFrame(width, layout, selection.side), surround = surroundFor(layout, source, selection.side);
+    const measureKey = JSON.stringify(["editor", path, selection.snapshot, selection.commentId, frame.width]);
+    const textColumns = Math.max(1, Math.floor((frame.width - 48) / 7.3));
     return [
       { kind: "bubble-gap", key: "inline-editor-top", path, surround, height: 12 },
-      { kind: "editor", key: "inline-editor", path, selection, frame, surround, height: 170 },
+      { kind: "editor", key: "inline-editor", path, selection, frame, surround, comment, outdated, measureKey,
+        height: commentHeights.get(measureKey) ?? 90 + Math.max(4, lines(noteText, textColumns)) * 20 },
       { kind: "editor-actions", key: "inline-editor-actions", path, selection, frame, surround, height: 44 },
       { kind: "bubble-gap", key: "inline-editor-bottom", path, surround, height: 12 },
     ];
   };
   const commentRow = (c, outdated, layout, source) => {
     const frame = commentFrame(width, layout, c.side), surround = surroundFor(layout, source, c.side);
-    const textColumns = Math.max(12, Math.floor((frame.width - 24) / 7.3));
+    if (selection?.commentId === c.id) return editor(c.path, layout, source, c, outdated);
+    const textColumns = Math.max(1, Math.floor((frame.width - 24) / 7.3));
+    const measureKey = JSON.stringify(["comment", c.id, c.body, outdated ? c.quote : null, frame.width]);
     return [
       { kind: "bubble-gap", key: `comment-top:${c.id}`, path: c.path, surround, height: 12 },
       { kind: "comment", key: `comment:${c.id}`, path: c.path, comment: c, outdated, frame, surround, height: 34 },
-      { kind: "comment-body", key: `comment-body:${c.id}`, path: c.path, comment: c, outdated, frame, surround,
-        height: Math.min(300, 60 + lines(c.body, textColumns) * 18 + (outdated ? Math.min(4, lines(c.quote, textColumns)) * 17 + 24 : 0)) },
+      { kind: "comment-body", key: `comment-body:${c.id}`, path: c.path, comment: c, outdated, frame, surround, measureKey,
+        height: commentHeights.get(measureKey) ?? 24 + lines(c.body, textColumns) * 20 + (outdated ? lines(c.quote, textColumns) * 20 + 24 : 0) },
+      { kind: "comment-actions", key: `comment-actions:${c.id}`, path: c.path, comment: c, frame, surround, height: 44 },
       { kind: "bubble-gap", key: `comment-bottom:${c.id}`, path: c.path, surround, height: 12 },
     ];
   };
@@ -95,7 +101,6 @@ export function buildPage(files, entries, comments, selection, { width = 840, vi
           for (const c of matching) {
             if (c.snapshot !== data.snapshot || numberOn(row, c.side) !== c.end || placed.has(c.id)) continue;
             rows.push(...commentRow(c, Boolean(data.stale || entry.changed), layout, row)); placed.add(c.id);
-            if (selection?.commentId === c.id) rows.push(...editor(path, layout, row));
           }
           if (selection && !selection.commentId && selection.path === path && selection.snapshot === data.snapshot && numberOn(row, selection.side) === selection.end) rows.push(...editor(path, layout, row));
         }
@@ -106,7 +111,6 @@ export function buildPage(files, entries, comments, selection, { width = 840, vi
       }
       for (const c of matching.filter(c => !placed.has(c.id))) {
         rows.push(...commentRow(c, Boolean(data || meta.status === "draft"), layout));
-        if (selection?.commentId === c.id) rows.push(...editor(path, layout));
       }
       rows.push({ kind: "end", key: `end:${path}`, path, height: 7 });
     }
@@ -184,7 +188,7 @@ export function hitControl(row, press) {
     if (row.meta.status !== "draft" && right("viewed")) return "viewed";
   }
   if (row.kind === "hunk" && row.expand && x >= 1 && x <= controlWidths.expand) return "expand";
-  if (row.kind === "comment") {
+  if (row.kind === "comment-actions") {
     if (right("delete")) return "delete";
     if (right("edit", controlWidths.delete + 6)) return "edit";
   }
