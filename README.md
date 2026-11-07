@@ -10,7 +10,10 @@ beside the code, then send one feedback batch to your coding agent.
 
 - **Cmd+Shift+R** opens a review immediately beside the focused agent's tab.
   Reopening returns to the same tab. Repository and recipient stay pinned.
-- A changed-file tree navigates stacked, collapsible diff cards.
+- A changed-file tree navigates stacked, collapsible diff cards. Drag its right
+  divider to resize it, or use Herdr's sidebar icon to collapse/restore it.
+  The last expanded width and collapsed state persist across Review tabs and
+  app restarts, independently of the repository.
 - Modified files use **split** diffs; new/deleted files use a single column.
   [Difftastic](https://github.com/Wilfred/difftastic) supplies structural alignment
   and changed-token highlights, with a Git text fallback.
@@ -131,7 +134,8 @@ code, not a user's repository or conversation.
 
 ## License
 
-Original reviewer/backend code is MIT licensed. The cloned Herdr tab bar retains
-its Apache-2.0 license. See [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
+Original reviewer/backend code is MIT licensed. The cloned Herdr tab bar and
+reused sidebar icon retain their Apache-2.0 license. See [LICENSE](LICENSE) and
+[THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES).
 GitHub's layout is a visual reference only; no GitHub Desktop source or branding
 is included. Difftastic and Herdr are separate dependencies, not bundled binaries.

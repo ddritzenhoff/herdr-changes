@@ -49,8 +49,15 @@ view-mode selector, Comments sidebar tab, or permanent comment composer.
 
 ## Review and comment
 
-- The left panel contains only the changed-file tree. Collapse folders or click
-  a file to jump to its card in the single scrolling review page.
+- The left panel contains the changed-file tree. Drag its right-hand divider to
+  resize it (normally 180–600 px; fitted narrower when the Review pane is small).
+  The sidebar icon beside **Files changed** collapses it to a narrow restore-button
+  rail; click that icon again to restore the last expanded width. Both width and
+  collapsed state are saved in Herdr's local shared preferences across Review
+  tabs, repositories and app restarts. No repository code or drafts are stored
+  in this appearance preference. `review.toggle-files` also toggles the tree.
+- Collapse folders or click a file to jump to its card in the single scrolling
+  review page. Resizing/collapsing the tree never discards an open comment.
 - Click a line number or code line to give it a persistent blue outline.
   This visual selection is independent of the current comment editor's anchor.
   Native hover reveals a filled blue **+**, even while another line is selected.
@@ -177,7 +184,9 @@ herdr-app status
 Directional-context tests cover both Git text and real Difftastic alignment,
 inserted-line offsets, repeated expansion/hunk joining, file boundaries, immutable
 snapshots and comments on revealed code. UI tests cover arrow hit zones, failure
-recovery and preserving open editors.
+recovery and preserving open editors. File-pane tests cover persisted width and
+collapse state, reopened/existing Review copies, invalid preferences, narrow
+viewports, native geometry resets, and preserving unsaved comments.
 
 Tests use temporary repositories and mocked agent transport. Native integration
 checks exercise stacked cards, scrolling large diffs offscreen/back, inline editor/save, and adjacent-tab

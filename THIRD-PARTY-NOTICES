@@ -12,6 +12,9 @@ Herdr's existing tab and panel behavior is preserved.
 mods/review-tabs/win-close.svg, win-max.svg, win-min.svg and win-restore.svg
 are the window-control vectors copied with that mod.
 
+mods/review/icons/sidebar.svg is the sidebar-toggle vector shipped with
+Herdr 0.1.13's workspace-chrome mod, reused for the Review file-tree control.
+
 The Herdr-derived portions remain under the Apache License, Version 2.0.
 The full license is provided in LICENSES/Apache-2.0.txt. This project's MIT
 license does not replace the original terms. Keep these notices when

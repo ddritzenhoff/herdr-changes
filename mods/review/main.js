@@ -1,12 +1,13 @@
 // A review-only page: file tree, stacked diff cards and inline feedback. Rust
 // owns Git, immutable snapshots, persistent drafts, viewed flags and messages.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextareaState, Textarea, EditorState, Editor, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
-import { appHome, exec, focused, spaces, agents, terminals, props, shared, settings, nextCommand, window, hc } from "herdr";
+import { v_flex, h_flex, h_resizable, resizable_panel, TextareaState, Textarea, EditorState, Editor, Scrollbar, v_virtual_list, VirtualListScrollHandle } from "gpui-base";
+import { appHome, exec, focused, spaces, agents, terminals, props, shared, setShared, settings, nextCommand, window, hc } from "herdr";
 import { errorText } from "./model.js";
 import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel } from "./page.js";
 import { desktopColors } from "./desktop.js";
 import { submitToIdleAgent } from "./delivery.js";
+import { filePaneKey, filePanePreferences, filePaneBounds } from "./sidebar.js";
 
 const icon = (name, size = 16) => svg(`mods/review/icons/${name}.svg`).size(size).flex_none();
 const lineBackground = (kind, t) => kind === "old" ? t.diffDel : kind === "new" ? t.diffAdd : kind === "empty" ? t.empty : t.background;
@@ -37,6 +38,12 @@ export default class Review extends View {
     this.collapsed = new Set(); this.folded = new Set(); this.queue = []; this.deferred = new Map();
     this.busy = false; this.pumping = false; this.scanning = false; this.revision = 0; this.rpc = Promise.resolve();
     this.visiblePaths = []; this.viewedPending = new Map();
+    const filePane = filePanePreferences(shared(filePaneKey));
+    this.filePaneWidth = filePane.width; this.filePaneCollapsed = filePane.collapsed;
+    // Native groups retain geometry by id, even across a mod reload. Use one
+    // identity per view lifetime, stable on ordinary repaints and native drags.
+    this.filePaneInstance = `${Date.now()}-${Math.random()}`;
+    this.filePaneRevision = 0;
     // The deferred renderer only records demand. A data scheduler drains it
     // outside layout, at most three files ahead, with no idle redraws.
     cx.timer.every(120, cx => this.loadVisible(cx));
@@ -52,6 +59,7 @@ export default class Review extends View {
       for (;;) {
         const command = await nextCommand();
         if (command === "submit") this.prepare(cx);
+        if (command === "toggle-files") this.toggleFilePane(cx);
       }
     });
     cx.timer.every(15000, cx => {
@@ -485,11 +493,59 @@ export default class Review extends View {
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.muted).whitespace_normal().child(row.text))
       .when(row.retry, el => el.child(control(`retry-${row.path}`, "Try again", "retry", !this.busy).h(23)));
   }
+  saveFilePane(patch, cx) {
+    const previous = filePanePreferences(shared(filePaneKey));
+    const next = filePanePreferences({ ...previous, ...patch });
+    // Our native drag already applied this width. workspace() handles other
+    // explicit layout changes without resetting the group on ordinary repaints.
+    if (patch.width !== undefined) this.filePaneWidth = next.width;
+    if (previous.width === next.width && previous.collapsed === next.collapsed) return;
+    setShared(filePaneKey, next); this.notify(cx);
+  }
+  toggleFilePane(cx) {
+    this.saveFilePane({ collapsed: !filePanePreferences(shared(filePaneKey)).collapsed }, cx);
+  }
+  resizeFilePane(sizes, cx) {
+    if (filePanePreferences(shared(filePaneKey)).collapsed || !Array.isArray(sizes) || !Number.isFinite(sizes[0]) || sizes[0] <= 0) return;
+    this.saveFilePane({ width: sizes[0] }, cx);
+  }
+  filePaneToggle(collapsed, t) {
+    const label = collapsed ? "Expand file tree" : "Collapse file tree";
+    return div().id("review-file-tree-toggle").size(28).flex_none().flex().items_center().justify_center().rounded(5)
+      .text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground)).cursor_pointer()
+      .role("button").accessibility_label(label).tooltip(label)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => { cx.stop_propagation(); this.toggleFilePane(cx); })
+      .child(icon("sidebar", 17));
+  }
+  workspace(t) {
+    const pane = filePanePreferences(shared(filePaneKey));
+    if (pane.width !== this.filePaneWidth || pane.collapsed !== this.filePaneCollapsed) {
+      this.filePaneWidth = pane.width; this.filePaneCollapsed = pane.collapsed; this.filePaneRevision++;
+    }
+    const bounds = filePaneBounds(this.workspaceWidth === undefined ? undefined : this.workspaceWidth - (pane.collapsed ? 44 : 0));
+    return h_flex().id("review-workspace").flex_1().min_w(0).min_h(0)
+      .on_size_change((size, cx) => {
+        if (Number.isFinite(size.width) && this.workspaceWidth !== size.width) {
+          this.workspaceWidth = size.width; this.filePaneRevision++; this.notify(cx);
+        }
+      })
+      .when(pane.collapsed, el => el.child(v_flex().id("review-file-tree-rail").w(44).h_full().flex_none().bg(t.sidebar).border_r(1).border_color(t.border)
+        .child(h_flex().h(43).flex_none().items_center().justify_center().child(this.filePaneToggle(true, t)))))
+      // Visibility/viewport changes need fresh initial sizes: otherwise the
+      // native group proportionally shrinks the remembered sidebar on restore.
+      .child(h_resizable(`review-file-panes:${this.filePaneInstance}:${this.filePaneRevision}`).flex_1().h_full().min_w(0).min_h(0)
+        .on_resize((sizes, cx) => this.resizeFilePane(sizes, cx))
+        .child(resizable_panel().size(Math.max(bounds.min, Math.min(bounds.max, pane.width))).size_range(bounds.min, bounds.max).visible(!pane.collapsed)
+          .when(!pane.collapsed, el => el.child(this.sidebar(t))))
+        .child(resizable_panel().size_range(bounds.contentMin).child(this.page(t))));
+  }
   sidebar(t) {
-    return v_flex().w(240).h_full().flex_none().min_h(0).border_r(1).border_color(t.border).bg(t.sidebar)
-      .child(h_flex().h(43).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().font_semibold().child("Files changed"))
-        .child(div().rounded(8).px(5).bg(t.raised).text_size(10).child(String(this.files.length))))
+    return v_flex().size_full().min_w(0).min_h(0).border_r(1).border_color(t.border).bg(t.sidebar)
+      .child(h_flex().h(43).flex_none().px(8).gap(8).items_center().border_b(1).border_color(t.border)
+        .child(this.filePaneToggle(false, t))
+        .child(div().flex_1().min_w(0).truncate().font_semibold().child("Files changed"))
+        .child(div().flex_none().rounded(8).px(5).bg(t.raised).text_size(10).child(String(this.files.length))))
       .child(v_flex().id("review-file-tree").flex_1().min_h(0).overflow_y_scrollbar().py(8).children(fileTree(this.files, this.folded).map(node => {
         const folder = node.kind === "folder", count = this.comments.filter(c => c.path === node.path).length;
         return h_flex().id(`tree-${node.path}`).h(29).flex_none().px(10).pl(10 + node.depth * 13).gap(6).items_center().rounded(4)
@@ -549,7 +605,7 @@ export default class Review extends View {
       .when(Boolean(this.message) && !this.preview, el => el.child(div().flex_none().px(14).py(6).bg(t.diffAdd).text_color(t.ansi2).child(this.message)))
       .when(Boolean(this.preview), el => el.child(this.previewView(t)))
       .when(!this.preview, el => el
-        .child(h_flex().flex_1().min_h(0).child(this.sidebar(t)).child(this.page(t)))
+        .child(this.workspace(t))
         .child(h_flex().h(46).flex_none().px(14).gap(10).items_center().border_t(1).border_color(t.border)
           .child(div().text_size(11).text_color(t.muted).child(`${Object.keys(this.viewed).length}/${this.files.length} files viewed · ${this.comments.length} draft comment${this.comments.length === 1 ? "" : "s"}`))
           .child(div().flex_1())

@@ -6,12 +6,14 @@ import { buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidth
 import { desktopColors } from "../mods/review/desktop.js";
 import { errorText } from "../mods/review/model.js";
 import { submitToIdleAgent } from "../mods/review/delivery.js";
+import { filePaneKey, filePanePreferences, filePaneBounds } from "../mods/review/sidebar.js";
 
 const source = (await readFile(new URL("../mods/review/main.js", import.meta.url), "utf8"))
   .replace(/^import .*;\n/gm, "")
   .replace("export default class Review", "globalThis.RootReview = class Review");
-function harness({ root = "/repo", register = false } = {}) {
-  const calls = [], sends = [], texts = [], handlers = new Map(), ids = [], notifications = [], moves = [], registry = {}, lists = [], scrolls = [], styles = new Map();
+function harness({ root = "/repo", register = false, registry = {} } = {}) {
+  const calls = [], sends = [], texts = [], handlers = new Map(), ids = [], notifications = [], moves = [], lists = [], scrolls = [], styles = new Map();
+  const groups = [], panels = [], sharedWrites = [];
   const backend = { comments: [], viewed: {}, failSend: false, failArchive: false, status: "idle", dark: true, active: true, version: 1, extraFiles: [], failViewed: false, pauseViewed: false, viewedWaiters: [] };
   let deferred = false;
   function builder() {
@@ -19,11 +21,13 @@ function harness({ root = "/repo", register = false } = {}) {
     const proxy = new Proxy({}, { get: (_, name) => (...args) => {
       if (deferred && String(name).startsWith("on_")) assert.fail("Handlers must not be registered in deferred code rows");
       if (name === "id") { id = args[0]; ids.push(id); styles.set(id, {}); }
-      if (id && ["opacity", "bg", "border_color", "disabled"].includes(name)) styles.get(id)[name] = args[0];
+      if (id && ["opacity", "bg", "border_color", "disabled", "size", "visible", "w", "tooltip", "accessibility_label"].includes(name)) styles.get(id)[name] = args[0];
+      if (id && name === "size_range") styles.get(id)[name] = args;
       if (id && name === "on_click") handlers.set(`${id}:click`, args[0]);
       if (id && name === "on_mouse_down") handlers.set(`${id}:down`, args[1]);
       if (id && name === "on_size_change") handlers.set(`${id}:size`, args[0]);
       if (id && name === "on_scroll_wheel") handlers.set(`${id}:scroll`, args[0]);
+      if (id && name === "on_resize") handlers.set(`${id}:resize`, args[0]);
       if (name === "when" && args[0]) args[1](proxy);
       if (name === "child" && typeof args[0] === "string") texts.push(args[0]);
       if (name === "on_item_click") lists.at(-1).click = args[0];
@@ -54,6 +58,8 @@ function harness({ root = "/repo", register = false } = {}) {
   const p = { root, agent: "t1", agentName: "Pi", space: "s1", ...(register ? { agentTab: "agent-tab", launchRoot: root } : {}) };
   const sandbox = {
     View: class {}, div: builder, svg: builder, v_flex: builder, h_flex: builder,
+    h_resizable(id) { groups.push(id); return builder().id(id); },
+    resizable_panel() { const id = `test-panel-${panels.length}`; panels.push(id); return builder().id(id); },
     TextareaState: { new: state }, EditorState: { new: state }, Textarea: { new: builder }, Editor: { new: builder },
     Scrollbar: { vertical: builder }, VirtualListScrollHandle: { new: () => ({ scroll_to_item: (...args) => scrolls.push(args) }) },
     v_virtual_list(_id, count, sizes, key, render) {
@@ -71,7 +77,7 @@ function harness({ root = "/repo", register = false } = {}) {
     spaces: () => [{ id: "s1", tabs: [{ id: "agent-tab" }, { id: "other-tab" }, { id: "review-tab", active: true }] }],
     agents: () => [{ address: "t1", space: "s1", status: backend.status, program: { name: "Pi" } }],
     terminals: () => [{ address: "t1", cwd: "/wrong-shell-directory", foreground: { cwd: "/repo" } }],
-    shared: key => registry[key], setShared: (key, value) => { registry[key] = value; },
+    shared: key => registry[key], setShared: (key, value) => { registry[key] = value; sharedWrites.push([key, value]); },
     run: (...args) => moves.push(args), window: () => ({ active: backend.active }),
     settings: () => ({ dark: backend.dark }), nextCommand: () => new Promise(() => {}),
     async exec(_binary, args) {
@@ -105,6 +111,7 @@ function harness({ root = "/repo", register = false } = {}) {
     },
     hc: async args => { sends.push(args); return backend.failSend ? { code: 1, stderr: "agent became busy" } : { code: 0 }; },
     buildPage, fileTree, hitLine, hitCode, hitControl, isCode, controlWidths, gutter, anchorLabel, desktopColors, errorText, submitToIdleAgent,
+    filePaneKey, filePanePreferences, filePaneBounds,
   };
   vm.runInNewContext(source, sandbox);
   const cx = {
@@ -148,8 +155,93 @@ function harness({ root = "/repo", register = false } = {}) {
     }
     await flush();
   }
-  return { view, cx, wrapper, flush, render, load, plus, type, comment, click, backend, calls, sends, texts, handlers, ids, notifications, moves, registry, lists, scrolls, styles };
+  return { view, cx, wrapper, flush, render, load, plus, type, comment, click, backend, calls, sends, texts, handlers, ids, notifications, moves, registry, lists, scrolls, styles, groups, panels, sharedWrites };
 }
+
+test("the native file-pane divider starts at the saved width and persists only completed, changed drags", async () => {
+  const h = harness(); await h.load(); h.render();
+  const group = h.groups.at(-1), filePanel = h.panels.at(-2);
+  assert.equal(h.styles.get(filePanel).size, 240);
+  assert.deepEqual(h.styles.get(filePanel).size_range, [180, 600]);
+  assert.equal(h.styles.get(filePanel).visible, true);
+  assert.equal(h.styles.get("review-file-tree-toggle").tooltip, "Collapse file tree");
+  assert.equal(h.sharedWrites.length, 0, "ordinary layout/render does not write preferences");
+  const requests = h.calls.length;
+  h.handlers.get(`${group}:resize`)([360, 700], h.cx); h.render();
+  assert.deepEqual(h.registry[filePaneKey], { width: 360, collapsed: false });
+  assert.equal(h.groups.at(-1), group, "a completed native drag does not reset its own group");
+  assert.equal(h.sharedWrites.length, 1);
+  h.handlers.get(`${group}:resize`)([360, 700], h.cx);
+  assert.equal(h.sharedWrites.length, 1, "unchanged callbacks do not rewrite state");
+  assert.equal(h.calls.length, requests, "resizing never recaptures code or contacts the backend");
+});
+
+test("file-tree collapse, last expanded width and the restore button survive a new Review instance", async () => {
+  const h = harness(); await h.flush(); h.render();
+  h.handlers.get(`${h.groups.at(-1)}:resize`)([375, 700], h.cx);
+  await h.click("review-file-tree-toggle"); h.render();
+  assert.deepEqual(h.registry[filePaneKey], { width: 375, collapsed: true });
+  assert.equal(h.styles.get(h.panels.at(-2)).visible, false);
+  assert.equal(h.styles.get("review-file-tree-rail").w, 44);
+  assert.equal(h.styles.get("review-file-tree-toggle").accessibility_label, "Expand file tree");
+  const restored = harness({ registry: JSON.parse(JSON.stringify(h.registry)) });
+  await restored.flush(); restored.render();
+  assert.ok(!restored.ids.includes("review-file-tree"), "collapsed reviews do not render the tree");
+  restored.handlers.get(`${restored.groups.at(-1)}:resize`)([0, 1000], restored.cx);
+  assert.equal(restored.sharedWrites.length, 0, "hiding a native panel cannot replace its saved expanded width with zero");
+  await restored.click("review-file-tree-toggle"); restored.render();
+  assert.deepEqual(restored.registry[filePaneKey], { width: 375, collapsed: false });
+  assert.equal(restored.styles.get(restored.panels.at(-2)).size, 375);
+  assert.equal(restored.styles.get(restored.panels.at(-2)).visible, true);
+  assert.notEqual(restored.groups.at(-1), h.groups.at(-1), "new views cannot reuse stale native geometry from a closed/reloaded view");
+});
+
+test("existing Review tabs apply another tab's saved width without resetting groups on ordinary renders", async () => {
+  const registry = {}, first = harness({ registry }), second = harness({ registry });
+  await first.flush(); await second.flush(); first.render(); second.render();
+  const original = second.groups.at(-1);
+  first.handlers.get(`${first.groups.at(-1)}:resize`)([420, 500], first.cx);
+  second.render(); const changed = second.groups.at(-1);
+  assert.notEqual(changed, original, "native initial-size state is refreshed for an external width change");
+  assert.equal(second.styles.get(second.panels.at(-2)).size, 420);
+  second.render(); assert.equal(second.groups.at(-1), changed);
+  await first.click("review-file-tree-toggle"); second.render();
+  assert.notEqual(second.groups.at(-1), changed, "visibility resets proportional native geometry so restore uses the saved width");
+  assert.equal(second.styles.get(second.panels.at(-2)).visible, false);
+  const hidden = second.groups.at(-1); second.render(); assert.equal(second.groups.at(-1), hidden);
+});
+
+test("narrow Review windows fit the file pane without overwriting the user's preferred width", async () => {
+  const h = harness({ registry: { [filePaneKey]: { width: 550, collapsed: false } } });
+  await h.flush(); h.render();
+  h.handlers.get("review-workspace:size")({ width: 400, height: 600 }, h.cx); h.render();
+  const panel = h.styles.get(h.panels.at(-2));
+  assert.equal(panel.size, 199); assert.deepEqual(panel.size_range, [180, 199]);
+  assert.equal(h.registry[filePaneKey].width, 550); assert.equal(h.sharedWrites.length, 0);
+  const small = h.groups.at(-1);
+  h.handlers.get("review-workspace:size")({ width: 1200, height: 600 }, h.cx); h.render();
+  assert.equal(h.styles.get(h.panels.at(-2)).size, 550);
+  assert.notEqual(h.groups.at(-1), small, "growing the viewport reapplies preferred pixels instead of stale native proportions");
+});
+
+test("resizing or collapsing the file tree preserves open comment text, anchors, snapshots and scroll requests", async () => {
+  const h = harness(); await h.load(); h.plus(); h.type("Keep this unsaved comment"); h.render();
+  const selection = h.view.selection, data = h.view.entries.get("src/main.rs").data, requests = h.calls.length, scrolls = h.scrolls.length;
+  h.handlers.get(`${h.groups.at(-1)}:resize`)([330, 500], h.cx);
+  await h.click("review-file-tree-toggle"); h.render();
+  h.handlers.get("review-page:size")({ width: 640, height: 600 }, h.cx);
+  assert.equal(h.view.selection, selection); assert.equal(h.view.note.value(), "Keep this unsaved comment");
+  assert.equal(h.view.entries.get("src/main.rs").data, data); assert.equal(h.calls.length, requests);
+  assert.equal(h.scrolls.length, scrolls); assert.ok(h.view.rows.some(r => r.kind === "editor"));
+});
+
+test("invalid native resize callbacks cannot corrupt persisted file-pane preferences", async () => {
+  const h = harness(); await h.flush(); h.render();
+  for (const sizes of [null, [], [NaN], [Infinity], [0], [-1], ["300"], { 0: 300 }]) h.view.resizeFilePane(sizes, h.cx);
+  assert.equal(h.sharedWrites.length, 0);
+  h.view.resizeFilePane([9000, 10], h.cx);
+  assert.equal(h.registry[filePaneKey].width, 600);
+});
 
 test("stacked review cards load lazily and do not contain the old toolbar or sidebar composer", async () => {
   const h = harness(); await h.flush(); h.render();
